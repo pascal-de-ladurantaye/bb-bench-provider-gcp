@@ -1,0 +1,51 @@
+{
+  "name": "bb-plugin-bench-provider-gcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A BB plugin that lends Google Compute Engine VMs to bb-autoresearch as remote bench hosts, over your own gcloud CLI.",
+  "license": "MIT",
+  "author": "Pascal de Ladurantaye <pascal.de.ladurantaye@gmail.com>",
+  "homepage": "https://github.com/pascal-de-ladurantaye/bb-bench-provider-gcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pascal-de-ladurantaye/bb-bench-provider-gcp.git"
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "engines": {
+    "bb": ">=0.45",
+    "bbPluginSdk": ">=0.6.14"
+  },
+  "bb": {
+    "name": "GCP Compute bench hosts",
+    "description": "Lends Google Compute Engine VMs to bb-autoresearch as remote bench hosts: creates self-deleting VMs with your gcloud login, moves files and runs processes over SSH.",
+    "branding": {
+      "icon": "Cloud"
+    },
+    "server": "./server.ts"
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.14",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.5.0",
+    "hono": "^4.11.9",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.11"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  }
+}
