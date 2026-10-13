@@ -27,6 +27,10 @@ export interface FakeConfig {
   osLoginUser?: string;
   reportTerminationTime?: boolean;
   missingMachineTypes?: string[];
+  /** Zones out of capacity, and how GCP says so (see fake-gcloud.mjs). */
+  stockouts?: Record<string, { how: "sync" | "op" | "stops"; code?: string; message?: string; opMs?: number; sleepMs?: number }>;
+  /** Every operation shows RUNNING while set. */
+  holdOps?: boolean;
   inject?: Record<string, { stderr?: string; code?: number; times?: number; sleepMs?: number }>;
 }
 
@@ -115,6 +119,11 @@ export class FakeCloud {
     } catch {
       return null;
     }
+  }
+
+  /** What a stockout left of a VM in a zone (null: nothing). */
+  leftover(name: string, zone: string): Record<string, unknown> | null {
+    return this.vm(`${name}@${zone}`);
   }
 
   patchVm(name: string, patch: Record<string, unknown>): void {

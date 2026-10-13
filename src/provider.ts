@@ -3,9 +3,11 @@
 // files, run processes. No study logic lives here.
 //
 //   create      gcloud compute instances create --async (labels, metadata,
-//               --max-run-duration + --instance-termination-action=DELETE)
+//               --max-run-duration + --instance-termination-action=DELETE),
+//               in the next zone of the list when one is out of capacity
 //   status      gcloud compute instances describe; once RUNNING, one ssh
-//               probe; `ready` when it answers
+//               probe; `ready` when it answers. A create GCP failed later for
+//               a stockout is sent on to the next zone here
 //   list        gcloud compute instances list --filter=labels...
 //   destroy     gcloud compute instances delete, detached (it takes minutes)
 //   info/files/exec   ssh with a shared ControlMaster connection
@@ -15,18 +17,21 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { BENCH_PROVIDER_CONTRACT_VERSION, EXEC_POLL_MAX_BYTES, type HostState, type MethodInput, type MethodOutput } from "./contract.ts";
-import { ProviderError, asProviderError, clip, mapGcloudError } from "./errors.ts";
-import { Budget, Gcloud, Tools } from "./gcloud.ts";
+import { ProviderError, asProviderError, clip, isStockout, mapGcloudError } from "./errors.ts";
+import { Budget, Gcloud, RPC_BUDGET_MS, Tools } from "./gcloud.ts";
 import { MAX_GCP_LABELS, labelFilter, labelsFlag, labelsMatch, parseExtraLabels, toGcpLabels } from "./labels.ts";
-import { canonicalMachine, machineOptionList, parseMachine, type GcpMachine } from "./machine-options.ts";
+import { canonicalMachine, machineOptionList, parseMachine, parseZoneList, type GcpMachine } from "./machine-options.ts";
 import { bootDiskType, chooseMachineType, customShape, defaultThreadsPerCore, effectiveVcpus, parseOverrides } from "./machine-types.ts";
 import { CANCEL, EXEC_ID_PATTERN, GET, INFO, LAUNCH, POLL, PROBE, PUT, parsePackages, startupScript, cpuQuotaCores, memoryLimitBytes, parseKv, utf8SafeLength } from "./remote.ts";
 import { Ssh, type SshTarget } from "./ssh.ts";
-import { HostStore, type HostRecord } from "./store.ts";
+import type { RunResult } from "./proc.ts";
+import { HostStore, type HostRecord, type InsertPlan } from "./store.ts";
 
 export interface Settings {
   project: string;
   zone: string;
+  /** Zones to try in order (comma- or space-separated); wins over zone. */
+  zones: string;
   account: string;
   machineSeries: string;
   machineTypes: string;
@@ -125,6 +130,10 @@ const REDELETE_AFTER_MS = 3 * 60_000;
 const CREATE_GRACE_MS = 3 * 60_000;
 /** Records of gone VMs are kept this long (a repeated create key still finds them). */
 const KEEP_GONE_MS = 24 * 3600_000;
+/** A create's operation is checked this long after it was sent; a create still not sent by then has failed. */
+const CREATE_WINDOW_MS = 15 * 60_000;
+/** Another zone is tried within a call only while this share of its budget is left (else the next status call tries it). */
+const NEXT_ZONE_RESERVE = 0.25;
 
 const ZONE_RE = /^[a-z]+-[a-z]+[0-9]+-[a-z]$/u;
 const PROJECT_RE = /^[a-z][a-z0-9.:-]{3,62}[a-z0-9]$/u;
@@ -148,6 +157,49 @@ export function parseHostId(hostId: string): SshTarget {
 export function vmName(prefix: string, key: string): string {
   return `${prefix}-${createHash("sha256").update(key).digest("hex").slice(0, 12)}`;
 }
+
+/** Where a record's VM is now (its zone may differ from the host id's after a stockout). */
+function targetOf(r: HostRecord): SshTarget {
+  return { project: r.project, zone: r.zone, name: r.name };
+}
+
+/** When the record's create was last sent. */
+function sentAt(r: HostRecord): number {
+  return r.insertedAt ?? r.createdAt;
+}
+
+/** GCP's reason from gcloud's stderr, without gcloud's preamble. */
+function gcpReason(stderr: string): string {
+  return clip(
+    stderr
+      .replace(/^\s*ERROR: \([^)]*\)\s*/u, "")
+      .replace(/^Could not fetch resource:\s*-?\s*/u, "")
+      .replace(/\s+/gu, " "),
+    300,
+  );
+}
+
+function operationWhy(op: Operation): string {
+  return (op.error?.errors ?? []).map((e) => `${e.code ?? "ERROR"}: ${e.message ?? ""}`).join("; ");
+}
+
+function outOfCapacity(stockouts: readonly string[]): string {
+  const zones = stockouts.map((s) => s.split(":")[0]);
+  return `${zones.join(", ")} ${zones.length === 1 ? "was" : "were"} out of capacity`;
+}
+
+/** The outcome of sending a create through a zone list. */
+type Placed =
+  /** The create was accepted in `zone` (the operation runs on). */
+  | { kind: "sent"; zone: string; operation: string | null; at: number; stockouts: string[] }
+  /** A VM of this name already exists in `zone`. */
+  | { kind: "exists"; zone: string; stockouts: string[] }
+  /** Out of time in this call: `zone` is the next to try. */
+  | { kind: "deferred"; zone: string; stockouts: string[] }
+  /** Every zone left was out of capacity. */
+  | { kind: "exhausted"; stockouts: string[] }
+  /** gcloud failed in `zone` for another reason (or timed out). */
+  | { kind: "failed"; zone: string; result: RunResult; stockouts: string[] };
 
 function lastSegment(url: string | undefined): string {
   return (url ?? "").split("/").pop() ?? "";
@@ -195,7 +247,8 @@ export class GcpBenchProvider {
   private readonly log: (message: string) => void;
   private readonly logDir: string;
   private readonly budgetMs: number | undefined;
-  private configCache: { at: number; project: string; zone: string } | null = null;
+  /** gcloud's own config values (project, compute/zone), read at most once a minute. */
+  private readonly configCache = new Map<string, { at: number; value: string }>();
   private describeCache: { at: number; ok: boolean; reason?: string; key: string } | null = null;
   /** Machine type shapes by project/zone/type; they don't change. */
   private readonly shapes = new Map<string, MachineShape>();
@@ -234,27 +287,53 @@ export class GcpBenchProvider {
     return k.startsWith("~/") ? join(homedir(), k.slice(2)) : k;
   }
 
-  /** Project and zone: the settings, else gcloud's own config (cached for a minute). */
-  private async where(budget: Budget): Promise<{ project: string; zone: string }> {
+  private async gcloudConfig(prop: "project" | "compute/zone", budget: Budget): Promise<string> {
+    const hit = this.configCache.get(prop);
+    if (hit && this.now() - hit.at < 60_000) return hit.value;
+    const value = (await this.gcloud.run(["config", "get-value", prop], `reading gcloud ${prop}`, budget.take(15_000, "gcloud config"))).trim();
+    this.configCache.set(prop, { at: this.now(), value });
+    return value;
+  }
+
+  private async projectOf(budget: Budget): Promise<string> {
+    const project = (await this.settings()).project.trim() || (await this.gcloudConfig("project", budget));
+    if (!project || !PROJECT_RE.test(project)) throw new ProviderError("invalid", "no GCP project: set the provider's project setting (or `gcloud config set project <id>`)");
+    return project;
+  }
+
+  /**
+   * The project, and the zones a create tries in order. Zones, first that is
+   * set wins: the machine options' (`pinned`: zones, else zone), the zones
+   * setting, the zone setting, gcloud's compute/zone.
+   */
+  private async where(budget: Budget, pinned: readonly string[] = []): Promise<{ project: string; zones: string[] }> {
     const s = await this.settings();
-    let project = s.project.trim();
-    let zone = s.zone.trim();
-    if (project === "" || zone === "") {
-      if (this.configCache && this.now() - this.configCache.at < 60_000) {
-        project ||= this.configCache.project;
-        zone ||= this.configCache.zone;
-      } else {
-        const read = async (prop: string) => (await this.gcloud.run(["config", "get-value", prop], `reading gcloud ${prop}`, budget.take(15_000, "gcloud config"))).trim();
-        const p = project || (await read("project"));
-        const z = zone || (await read("compute/zone"));
-        this.configCache = { at: this.now(), project: p, zone: z };
-        project = p;
-        zone = z;
+    const project = await this.projectOf(budget);
+    let zones = [...pinned];
+    if (zones.length === 0) {
+      try {
+        zones = parseZoneList(s.zones);
+      } catch (error) {
+        throw new ProviderError("invalid", `the zones setting: ${(error as Error).message}`);
       }
     }
-    if (!project || !PROJECT_RE.test(project)) throw new ProviderError("invalid", "no GCP project: set the provider's project setting (or `gcloud config set project <id>`)");
-    if (!zone || !ZONE_RE.test(zone)) throw new ProviderError("invalid", "no GCE zone: set the provider's zone setting (or `gcloud config set compute/zone <zone>`)");
-    return { project, zone };
+    if (zones.length === 0) {
+      const zone = s.zone.trim() || (await this.gcloudConfig("compute/zone", budget));
+      if (!zone || !ZONE_RE.test(zone)) throw new ProviderError("invalid", "no GCE zone: set the provider's zones or zone setting (or `gcloud config set compute/zone <zone>`)");
+      zones = [zone];
+    }
+    return { project, zones };
+  }
+
+  /** The machine options' zones: `zones`, else `zone`, else none (the settings decide). */
+  private pinnedZones(machine: GcpMachine): string[] {
+    if (machine.zones) return machine.zones.split(",");
+    return machine.zone ? [machine.zone] : [];
+  }
+
+  /** Time a call keeps back before it tries another zone. */
+  private nextZoneReserveMs(): number {
+    return Math.round((this.budgetMs ?? RPC_BUDGET_MS) * NEXT_ZONE_RESERVE);
   }
 
   // ── lifecycle ──────────────────────────────────────────────────────────
@@ -270,7 +349,7 @@ export class GcpBenchProvider {
       cores: { min: 1, max: s.maxCores },
       machineOptions: machineOptionList(),
     };
-    const cacheKey = JSON.stringify([s.project, s.zone, s.account, s.gcloudPath]);
+    const cacheKey = JSON.stringify([s.project, s.zone, s.zones, s.account, s.gcloudPath]);
     const c = this.describeCache;
     if (c && c.key === cacheKey && this.now() - c.at < (c.ok ? 300_000 : 30_000)) {
       return c.ok ? base : { ...base, available: false, reason: c.reason ?? "unavailable" };
@@ -278,12 +357,13 @@ export class GcpBenchProvider {
     try {
       const budget = new Budget(Math.min(this.budgetMs ?? 40_000, 40_000), this.now);
       if (!(await this.tools.find("ssh"))) throw new ProviderError("internal", "ssh is not installed or not on PATH");
-      const { project, zone } = await this.where(budget);
+      const { project, zones } = await this.where(budget);
+      const zone = zones[0]!;
       const account = (await this.gcloud.run(["auth", "list", "--filter=status:ACTIVE", "--format=value(account)"], "checking the gcloud login", budget.take(15_000, "gcloud auth list"))).trim();
       if (account === "" && s.account.trim() === "") throw new ProviderError("auth", "gcloud has no active account. Run `gcloud auth login`.");
       await this.gcloud.run(["compute", "zones", "describe", zone, `--project=${project}`, "--format=value(name)"], `checking access to ${project}/${zone}`, budget.take(20_000, "gcloud zones describe"));
       this.describeCache = { at: this.now(), ok: true, key: cacheKey };
-      return { ...base, displayName: `GCP Compute Engine VMs (${project}, ${zone})`.slice(0, 200) };
+      return { ...base, displayName: `GCP Compute Engine VMs (${project}, ${zones.join(", ")})`.slice(0, 200) };
     } catch (error) {
       const reason = clip(asProviderError(error).message, 1990);
       this.describeCache = { at: this.now(), ok: false, reason, key: cacheKey };
@@ -311,12 +391,10 @@ export class GcpBenchProvider {
     if (live.length >= s.maxHosts) throw new ProviderError("capacity", `${live.length} VMs are already running (the maxHosts setting is ${s.maxHosts})`);
     if (Object.keys(input.labels).length + 2 > MAX_GCP_LABELS) throw new ProviderError("invalid", `at most ${MAX_GCP_LABELS - 2} labels`);
 
-    const where = await this.where(budget);
-    const project = where.project;
-    const zone = machine.zone ?? where.zone;
+    const { project, zones } = await this.where(budget, this.pinnedZones(machine));
+    const zone = zones[0]!;
     const prefix = s.labelPrefix;
-    const target: SshTarget = { project, zone, name: vmName(s.namePrefix, identity) };
-    const hostId = hostIdOf(target);
+    const name = vmName(s.namePrefix, identity);
     const threadsPerCore = machine.threadsPerCore ?? (s.threadsPerCore === "1" ? 1 : s.threadsPerCore === "2" ? 2 : undefined);
     const machineType = this.machineTypeFor(s, machine, input.cores, input.memoryGb);
     const fit = await this.checkFit(project, zone, machineType, machine, threadsPerCore, input, budget);
@@ -336,82 +414,138 @@ export class GcpBenchProvider {
       throw new ProviderError("invalid", (error as Error).message);
     }
     if (Object.keys(input.labels).length + Object.keys(extra).length + 2 > MAX_GCP_LABELS) throw new ProviderError("invalid", `at most ${MAX_GCP_LABELS} labels per VM, counting the extraLabels setting`);
-    const gcpLabels = { ...extra, [`${prefix}-managed`]: "true", [`${prefix}-key`]: target.name.slice(s.namePrefix.length + 1), ...toGcpLabels(prefix, input.labels) };
+    const gcpLabels = { ...extra, [`${prefix}-managed`]: "true", [`${prefix}-key`]: name.slice(s.namePrefix.length + 1), ...toGcpLabels(prefix, input.labels) };
 
     const spot = machine.spot ?? s.provisioningModel === "spot";
-    const dir = mkdtempSync(join(tmpdir(), "bb-bench-gcp-"));
-    try {
-      writeFileSync(join(dir, "info.json"), JSON.stringify(info));
-      writeFileSync(join(dir, "ssh-keys"), `${s.sshUser}:${publicKey}\n`);
-      const metadataFiles = [`${INFO_METADATA_KEY}=${join(dir, "info.json")}`, `ssh-keys=${join(dir, "ssh-keys")}`];
-      if (packages.length > 0) {
-        writeFileSync(join(dir, "startup-script"), startupScript(packages));
-        metadataFiles.push(`startup-script=${join(dir, "startup-script")}`);
-      }
-      const args = [
-        "compute", "instances", "create", target.name,
-        `--project=${project}`,
-        `--zone=${zone}`,
-        `--machine-type=${machineType}`,
-        machine.image ? `--image=${machine.image}` : `--image-family=${machine.imageFamily ?? s.imageFamily}`,
-        `--image-project=${machine.imageProject ?? s.imageProject}`,
-        `--boot-disk-size=${machine.bootDiskGb ?? s.bootDiskSizeGb}GB`,
-        `--boot-disk-type=${bootDiskType(machine.bootDiskType ?? s.bootDiskType, machineType)}`,
-        `--labels=${labelsFlag(gcpLabels)}`,
-        `--metadata-from-file=${metadataFiles.join(",")}`,
-        `--max-run-duration=${lifetime}s`,
-        "--instance-termination-action=DELETE",
-        `--provisioning-model=${spot ? "SPOT" : "STANDARD"}`,
-        "--no-service-account",
-        "--no-scopes",
-        "--async",
-        "--format=json",
-      ];
-      if (s.network.trim()) args.push(`--network=${s.network.trim()}`);
-      if (s.subnet.trim()) args.push(`--subnet=${s.subnet.trim()}`);
-      if (!s.externalIp) args.push("--no-address");
-      if (threadsPerCore !== undefined) args.push(`--threads-per-core=${threadsPerCore}`);
-      if (machine.visibleCoreCount !== undefined) args.push(`--visible-core-count=${machine.visibleCoreCount}`);
-      if (machine.minCpuPlatform !== undefined) args.push(`--min-cpu-platform=${machine.minCpuPlatform}`);
-      if (machine.turboMode !== undefined) args.push(`--turbo-mode=${machine.turboMode}`);
-      if (machine.performanceMonitoringUnit !== undefined) args.push(`--performance-monitoring-unit=${machine.performanceMonitoringUnit}`);
-      if (machine.bootDiskIops !== undefined) args.push(`--boot-disk-provisioned-iops=${machine.bootDiskIops}`);
-      if (machine.bootDiskThroughput !== undefined) args.push(`--boot-disk-provisioned-throughput=${machine.bootDiskThroughput}`);
-      if (machine.networkTier !== undefined) args.push(`--network-tier=${machine.networkTier}`);
+    const metadata: Record<string, string> = { [INFO_METADATA_KEY]: JSON.stringify(info), "ssh-keys": `${s.sshUser}:${publicKey}\n` };
+    if (packages.length > 0) metadata["startup-script"] = startupScript(packages);
+    const args = [
+      `--machine-type=${machineType}`,
+      machine.image ? `--image=${machine.image}` : `--image-family=${machine.imageFamily ?? s.imageFamily}`,
+      `--image-project=${machine.imageProject ?? s.imageProject}`,
+      `--boot-disk-size=${machine.bootDiskGb ?? s.bootDiskSizeGb}GB`,
+      `--boot-disk-type=${bootDiskType(machine.bootDiskType ?? s.bootDiskType, machineType)}`,
+      `--labels=${labelsFlag(gcpLabels)}`,
+      "--instance-termination-action=DELETE",
+      `--provisioning-model=${spot ? "SPOT" : "STANDARD"}`,
+      "--no-service-account",
+      "--no-scopes",
+    ];
+    if (s.network.trim()) args.push(`--network=${s.network.trim()}`);
+    if (s.subnet.trim()) args.push(`--subnet=${s.subnet.trim()}`);
+    if (!s.externalIp) args.push("--no-address");
+    if (threadsPerCore !== undefined) args.push(`--threads-per-core=${threadsPerCore}`);
+    if (machine.visibleCoreCount !== undefined) args.push(`--visible-core-count=${machine.visibleCoreCount}`);
+    if (machine.minCpuPlatform !== undefined) args.push(`--min-cpu-platform=${machine.minCpuPlatform}`);
+    if (machine.turboMode !== undefined) args.push(`--turbo-mode=${machine.turboMode}`);
+    if (machine.performanceMonitoringUnit !== undefined) args.push(`--performance-monitoring-unit=${machine.performanceMonitoringUnit}`);
+    if (machine.bootDiskIops !== undefined) args.push(`--boot-disk-provisioned-iops=${machine.bootDiskIops}`);
+    if (machine.bootDiskThroughput !== undefined) args.push(`--boot-disk-provisioned-throughput=${machine.bootDiskThroughput}`);
+    if (machine.networkTier !== undefined) args.push(`--network-tier=${machine.networkTier}`);
+    const plan: InsertPlan = { args, metadata };
 
-      const createdAt = this.now();
-      const result = await this.gcloud.raw(args, budget.take(45_000, "gcloud compute instances create"));
-      if (result.timedOut) throw new ProviderError("transient", `creating ${target.name}: gcloud did not finish in time; retry with the same key`);
-      let operation: string | null = null;
-      if (result.code !== 0) {
-        if (/already exists/iu.test(result.stderr)) return await this.adopt(target, input, machine, machineType, lifetime, budget);
-        const mapped = mapGcloudError(`creating ${target.name} (${machineType} in ${zone})`, result.stderr);
+    const createdAt = this.now();
+    let placed = await this.place({ project, name, zones, from: 0, stockouts: [], plan, lifetimeSeconds: lifetime, budget });
+    const at = (z: string): SshTarget => ({ project, zone: z, name });
+    const inZone = (z: string, stockouts: readonly string[]) => `${machineType} in ${z}${stockouts.length > 0 ? `, after ${outOfCapacity(stockouts)}` : ""}`;
+    if (placed.kind === "exists") return await this.adopt(at(placed.zone), input, machine, machineType, lifetime, budget);
+    if (placed.kind === "exhausted") {
+      const last = placed.stockouts[placed.stockouts.length - 1] ?? "";
+      throw new ProviderError(
+        "capacity",
+        zones.length === 1
+          ? `creating ${name} (${machineType} in ${zone}): ${last.slice(zone.length + 2)}`
+          : `creating ${name} (${machineType}): every zone is out of capacity (${placed.stockouts.join("; ")})`,
+      );
+    }
+    if (placed.kind === "failed") {
+      const { result } = placed;
+      const mapped = result.timedOut ? null : mapGcloudError(`creating ${name} (${inZone(placed.zone, placed.stockouts)})`, result.stderr);
+      // A later zone that timed out or hiccupped: status sends the create there again.
+      if (placed.stockouts.length > 0 && (mapped === null || mapped.code === "transient")) {
+        placed = { kind: "deferred", zone: placed.zone, stockouts: placed.stockouts };
+      } else {
+        if (!mapped) throw new ProviderError("transient", `creating ${name}: gcloud did not finish in time; retry with the same key`);
         // A missing image, network or machine type is a bad setting, not a missing VM.
         throw mapped.code === "not_found" ? new ProviderError("invalid", mapped.message.replace(/^\[not_found\] /u, "")) : mapped;
       }
-      operation = /(operation-[a-z0-9-]+)/u.exec(`${result.stdout.toString("utf8")}\n${result.stderr}`)?.[1] ?? null;
-      const record: HostRecord = {
-        hostId,
-        ...target,
-        key: identity,
-        labels: input.labels,
-        cores: input.cores,
-        memoryGb: input.memoryGb ?? null,
-        machineType,
-        ...(canonicalMachine(machine) ? { machine } : {}),
-        ...(fit?.note ? { machineNote: fit.note } : {}),
-        packages,
-        createdAt,
-        expiresAt: createdAt + lifetime * 1000,
-        operation,
-        lastState: "provisioning",
-      };
-      await this.store.put(record);
-      this.log(`create ${hostId}: ${machineType}${canonicalMachine(machine) ? ` ${canonicalMachine(machine)}` : ""}, lifetime ${lifetime}s, ${spot ? "spot" : "standard"}${fit?.note ? ` (${fit.note})` : ""}`);
-      return { hostId, state: "provisioning", expiresAt: iso(record.expiresAt) };
+    }
+    const target = at(placed.zone);
+    const hostId = hostIdOf(target);
+    const record: HostRecord = {
+      hostId,
+      ...target,
+      key: identity,
+      labels: input.labels,
+      cores: input.cores,
+      memoryGb: input.memoryGb ?? null,
+      machineType,
+      ...(canonicalMachine(machine) ? { machine } : {}),
+      ...(fit?.note ? { machineNote: fit.note } : {}),
+      packages,
+      createdAt,
+      expiresAt: createdAt + lifetime * 1000,
+      operation: placed.kind === "sent" ? placed.operation : null,
+      lastState: "provisioning",
+      ...(zones.length > 1 ? { zones, plan } : {}),
+      ...(placed.stockouts.length > 0 ? { stockouts: placed.stockouts } : {}),
+      ...(placed.kind === "sent" ? { insertedAt: placed.at } : { pendingInsert: true }),
+    };
+    await this.store.put(record);
+    const how = `${machineType}${canonicalMachine(machine) ? ` ${canonicalMachine(machine)}` : ""}, lifetime ${lifetime}s, ${spot ? "spot" : "standard"}${fit?.note ? ` (${fit.note})` : ""}`;
+    this.log(`create ${hostId}: ${how}${placed.stockouts.length > 0 ? `; ${outOfCapacity(placed.stockouts)}` : ""}${placed.kind === "deferred" ? `; ${placed.zone} is tried by the next status call` : ""}`);
+    return { hostId, state: "provisioning", expiresAt: iso(record.expiresAt) };
+  }
+
+  /** `gcloud compute instances create` of the plan in one zone, with the metadata in temporary files. */
+  private async insert(target: SshTarget, plan: InsertPlan, lifetimeSeconds: number, budget: Budget): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "bb-bench-gcp-"));
+    try {
+      const files = Object.entries(plan.metadata).map(([key, value], i) => {
+        const file = join(dir, `m${i}`);
+        writeFileSync(file, value);
+        return `${key}=${file}`;
+      });
+      const args = [
+        "compute", "instances", "create", target.name,
+        `--project=${target.project}`,
+        `--zone=${target.zone}`,
+        ...plan.args,
+        `--metadata-from-file=${files.join(",")}`,
+        `--max-run-duration=${lifetimeSeconds}s`,
+        "--async",
+        "--format=json",
+      ];
+      return await this.gcloud.raw(args, budget.take(45_000, "gcloud compute instances create"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  /**
+   * Send the create to `zones[from]`, and while GCP says a zone is out of
+   * capacity, to each next one. A further zone is tried only while the call
+   * has NEXT_ZONE_RESERVE of its budget left; otherwise `deferred`, for the
+   * next status call.
+   */
+  private async place(o: { project: string; name: string; zones: readonly string[]; from: number; stockouts: readonly string[]; plan: InsertPlan; lifetimeSeconds: number; budget: Budget }): Promise<Placed> {
+    const stockouts = [...o.stockouts];
+    for (let i = o.from; i < o.zones.length; i++) {
+      const zone = o.zones[i]!;
+      if (i > o.from && o.budget.left() < this.nextZoneReserveMs()) return { kind: "deferred", zone, stockouts };
+      const at = this.now();
+      const result = await this.insert({ project: o.project, zone, name: o.name }, o.plan, o.lifetimeSeconds, o.budget);
+      if (result.timedOut) return { kind: "failed", zone, result, stockouts };
+      if (result.code === 0) {
+        const operation = /(operation-[a-z0-9-]+)/u.exec(`${result.stdout.toString("utf8")}\n${result.stderr}`)?.[1] ?? null;
+        return { kind: "sent", zone, operation, at, stockouts };
+      }
+      if (/already exists/iu.test(result.stderr)) return { kind: "exists", zone, stockouts };
+      if (!isStockout(result.stderr)) return { kind: "failed", zone, result, stockouts };
+      stockouts.push(`${zone}: ${gcpReason(result.stderr)}`);
+      this.log(`create ${o.name}: ${zone} is out of capacity${i + 1 < o.zones.length ? `; trying ${o.zones[i + 1]}` : ""}`);
+    }
+    return { kind: "exhausted", stockouts };
   }
 
   /** A create that found its VM already there (a retry after a lost response): take it if it carries this key. */
@@ -445,23 +579,24 @@ export class GcpBenchProvider {
   }
 
   async status({ hostId }: { hostId: string }): Promise<MethodOutput<"benchProvider.status">> {
-    const target = parseHostId(hostId);
+    const parsed = parseHostId(hostId);
     const budget = this.budget();
     let record = await this.store.get(hostId);
     if (record?.deleteRequestedAt) return { state: "gone", expiresAt: iso(record.expiresAt), detail: "destroyed" };
+    if (record?.pendingInsert) return await this.sendPending(record, budget);
+    const target = record ? targetOf(record) : parsed;
     const s = await this.settings();
     const inst = await this.describeInstance(target, budget);
 
     if (!inst) {
-      if (record && !record.runningSince && record.operation && this.now() - record.createdAt < 15 * 60_000) {
+      // A create that failed (every zone out of capacity, say) stays failed.
+      if (record && !record.runningSince && record.lastState === "failed") return { state: "failed", expiresAt: iso(record.expiresAt), detail: clip(record.detail || "create failed", 2000) };
+      if (record && !record.runningSince && record.operation && this.now() - sentAt(record) < CREATE_WINDOW_MS) {
         const op = await this.describeOperation(target, record.operation, budget).catch(() => null);
-        if (op?.error?.errors?.length) {
-          const why = op.error.errors.map((e) => `${e.code ?? "ERROR"}: ${e.message ?? ""}`).join("; ");
-          await this.store.update(hostId, { lastState: "failed", detail: clip(why, 1900) });
-          return { state: "failed", expiresAt: iso(record.expiresAt), detail: clip(`create failed: ${why}`, 2000) };
-        }
-        if (op && op.status !== "DONE") return { state: "provisioning", expiresAt: iso(record.expiresAt), detail: `creating (${op.status ?? "pending"})` };
-        if (!op && this.now() - record.createdAt < CREATE_GRACE_MS) return { state: "provisioning", expiresAt: iso(record.expiresAt), detail: "creating" };
+        if (op?.error?.errors?.length) return await this.createFailed(record, op, false, budget);
+        const moved = record.stockouts?.length ? ` in ${record.zone} (${outOfCapacity(record.stockouts)})` : "";
+        if (op && op.status !== "DONE") return { state: "provisioning", expiresAt: iso(record.expiresAt), detail: `creating${moved} (${op.status ?? "pending"})` };
+        if (!op && this.now() - sentAt(record) < CREATE_GRACE_MS) return { state: "provisioning", expiresAt: iso(record.expiresAt), detail: `creating${moved}` };
       }
       if (record) await this.store.update(hostId, { lastState: "gone" });
       const expired = record && this.now() >= record.expiresAt;
@@ -472,14 +607,12 @@ export class GcpBenchProvider {
     let state = this.stateOf(inst, record);
 
     // A VM that stops before it was ever ready may be a create GCP gave up on (a
-    // stockout shows as STOPPING, then the VM vanishes): that is `failed`, with GCP's reason.
-    if (record && !record.readyAt && record.operation && state === "suspended" && this.now() - record.createdAt < 15 * 60_000) {
+    // stockout shows as STOPPING, then the VM vanishes): the next zone, or `failed`
+    // with GCP's reason. While the create still runs, GCP hasn't said yet.
+    if (record && !record.readyAt && record.operation && state === "suspended" && this.now() - sentAt(record) < CREATE_WINDOW_MS) {
       const op = await this.describeOperation(target, record.operation, budget).catch(() => null);
-      if (op?.error?.errors?.length) {
-        const why = op.error.errors.map((e) => `${e.code ?? "ERROR"}: ${e.message ?? ""}`).join("; ");
-        await this.store.update(hostId, { lastState: "failed", detail: clip(why, 1900) });
-        return { state: "failed", expiresAt: iso(expiresAt), detail: clip(`create failed: ${why}`, 2000) };
-      }
+      if (op?.error?.errors?.length) return await this.createFailed(record, op, true, budget);
+      if (op && op.status !== "DONE") return { state: "provisioning", expiresAt: iso(expiresAt), detail: `GCE ${inst.status}; the create is still running (${op.status ?? "pending"})` };
     }
     let detail: string | undefined = state !== "ready" && inst.status ? `GCE ${inst.status}${inst.statusMessage ? `: ${inst.statusMessage}` : ""}` : undefined;
 
@@ -516,6 +649,79 @@ export class GcpBenchProvider {
     return { state, expiresAt: iso(expiresAt), ...(detail ? { detail: clip(detail, 2000) } : {}) };
   }
 
+  /**
+   * The create's operation failed. A stockout with a zone left moves the
+   * create on to it (and deletes what GCP left of the VM in this zone);
+   * anything else is `failed`, with GCP's reason.
+   */
+  private async createFailed(record: HostRecord, op: Operation, remnant: boolean, budget: Budget): Promise<MethodOutput<"benchProvider.status">> {
+    const why = operationWhy(op);
+    const zones = record.zones ?? [record.zone];
+    const next = zones.indexOf(record.zone) + 1;
+    const stockouts = [...(record.stockouts ?? []), `${record.zone}: ${clip(why, 300)}`];
+    if (isStockout(why) && next > 0 && next < zones.length && record.plan) {
+      if (remnant) await this.deleteDetached(targetOf(record)).catch((e) => this.log(`status ${record.hostId}: deleting the stopped VM in ${record.zone} failed: ${asProviderError(e).message}`));
+      this.log(`status ${record.hostId}: ${record.zone} is out of capacity; trying ${zones[next]}`);
+      const moved = await this.store.update(record.hostId, { zone: zones[next]!, operation: null, pendingInsert: true, stockouts, lastState: "provisioning" });
+      // Too little of this call left after the describes: the next status call sends it.
+      if (budget.left() < this.nextZoneReserveMs()) return { state: "provisioning", expiresAt: iso(record.expiresAt), detail: `creating (${outOfCapacity(stockouts)}); ${zones[next]} is next` };
+      return await this.sendPending(moved ?? record, budget);
+    }
+    const detail = isStockout(why) && stockouts.length > 1 ? `create failed: every zone is out of capacity (${stockouts.join("; ")})` : `create failed: ${why}`;
+    await this.store.update(record.hostId, { lastState: "failed", detail: clip(detail, 1900), stockouts });
+    return { state: "failed", expiresAt: iso(record.expiresAt), detail: clip(detail, 2000) };
+  }
+
+  /**
+   * Send a create that is still to be sent (a stockout moved it on to the
+   * record's zone, or the call before ran out of time), and on through the
+   * zones while they are out of capacity and this call has time.
+   */
+  private async sendPending(record: HostRecord, budget: Budget): Promise<MethodOutput<"benchProvider.status">> {
+    const expiresAt = iso(record.expiresAt);
+    const zones = record.zones ?? [record.zone];
+    const from = zones.indexOf(record.zone);
+    const stockouts = record.stockouts ?? [];
+    const fail = async (detail: string): Promise<MethodOutput<"benchProvider.status">> => {
+      await this.store.update(record.hostId, { lastState: "failed", pendingInsert: false, detail: clip(detail, 1900) });
+      return { state: "failed", expiresAt, detail: clip(detail, 2000) };
+    };
+    if (!record.plan || from < 0) return await fail(`the create can't be sent to ${record.zone} (the record has no create to send)`);
+    if (this.now() - record.createdAt > CREATE_WINDOW_MS) return await fail(`the VM could not be created within ${CREATE_WINDOW_MS / 60_000} minutes${stockouts.length > 0 ? ` (${stockouts.join("; ")})` : ""}`);
+    const lifetimeSeconds = Math.max(MIN_LIFETIME_SECONDS, Math.round((record.expiresAt - this.now()) / 1000));
+    const placed = await this.place({ project: record.project, name: record.name, zones, from, stockouts, plan: record.plan, lifetimeSeconds, budget });
+    const why = placed.stockouts.length > 0 ? ` (${outOfCapacity(placed.stockouts)})` : "";
+    switch (placed.kind) {
+      case "sent":
+        await this.store.update(record.hostId, { zone: placed.zone, operation: placed.operation, insertedAt: placed.at, pendingInsert: false, stockouts: placed.stockouts, lastState: "provisioning" });
+        this.log(`status ${record.hostId}: create sent to ${placed.zone}${why}`);
+        return { state: "provisioning", expiresAt, detail: `creating in ${placed.zone}${why}` };
+      case "deferred":
+        await this.store.update(record.hostId, { zone: placed.zone, pendingInsert: true, stockouts: placed.stockouts, lastState: "provisioning" });
+        return { state: "provisioning", expiresAt, detail: `creating${why}; ${placed.zone} is next` };
+      case "exhausted":
+        await this.store.update(record.hostId, { stockouts: placed.stockouts });
+        return await fail(`create failed: every zone is out of capacity (${placed.stockouts.join("; ")})`);
+      case "exists": {
+        // A create of ours sent there before (one that timed out, say): the VM is this host if it carries its key and options.
+        const there = { project: record.project, zone: placed.zone, name: record.name };
+        const info = await this.describeInstance(there, budget).then((inst) => (inst ? vmInfo(inst) : null));
+        if (!info || identityOf(info.key, info.machine ?? {}) !== record.key) return await fail(`a VM named ${record.name} already exists in ${placed.zone} and was not created for this key`);
+        await this.store.update(record.hostId, { zone: placed.zone, operation: null, insertedAt: this.now(), pendingInsert: false, stockouts: placed.stockouts, lastState: "provisioning" });
+        return { state: "provisioning", expiresAt, detail: `creating in ${placed.zone}${why}` };
+      }
+      case "failed": {
+        const { result } = placed;
+        const mapped = result.timedOut ? new ProviderError("transient", "gcloud did not finish in time") : mapGcloudError(`creating ${record.name} (${record.machineType} in ${placed.zone})`, result.stderr);
+        if (mapped.code === "transient") {
+          await this.store.update(record.hostId, { zone: placed.zone, pendingInsert: true, stockouts: placed.stockouts });
+          return { state: "provisioning", expiresAt, detail: clip(`creating in ${placed.zone}${why}: ${mapped.message}; retrying`, 2000) };
+        }
+        return await fail(`create failed${why}: ${mapped.message}`);
+      }
+    }
+  }
+
   /** GCE status → HostState (no SSH check: `ready` needs a record that saw SSH work). */
   private stateOf(inst: Instance, record: HostRecord | null): HostState {
     switch (inst.status) {
@@ -547,7 +753,7 @@ export class GcpBenchProvider {
   async list({ labels }: { labels: Record<string, string> }): Promise<MethodOutput<"benchProvider.list">> {
     const s = await this.settings();
     const budget = this.budget();
-    const { project } = await this.where(budget);
+    const project = await this.projectOf(budget);
     const prefix = s.labelPrefix;
     const filter = labelFilter({ [`${prefix}-managed`]: "true", ...toGcpLabels(prefix, labels) });
     const instances =
@@ -555,15 +761,25 @@ export class GcpBenchProvider {
     const hosts: MethodOutput<"benchProvider.list">["hosts"] = [];
     const seen = new Set<string>();
     const now = this.now();
+    // A record's VM is in the record's zone; its host id names the zone its create was first sent to.
+    const records = await this.store.list();
+    const byTarget = new Map(records.map((r) => [hostIdOf(r), r] as const));
+    const byHostId = new Map(records.map((r) => [r.hostId, r] as const));
     for (const inst of instances) {
       const zone = lastSegment(inst.zone);
       if (!ZONE_RE.test(zone) || !NAME_RE.test(inst.name)) continue;
       const info = vmInfo(inst);
       if (!info || !labelsMatch(info.labels, labels)) continue;
       const target = { project, zone, name: inst.name };
-      const hostId = hostIdOf(target);
+      const record = byTarget.get(hostIdOf(target)) ?? null;
+      if (!record && byHostId.has(hostIdOf(target))) {
+        // What a stockout left in a zone the create moved on from: not the host (that is in the record's zone).
+        // GCP removes it; if it hasn't, this does.
+        if (inst.status !== "STOPPING") await this.deleteDetached(target).catch((e) => this.log(`list: deleting ${inst.name}'s leftover in ${zone} failed: ${asProviderError(e).message}`));
+        continue;
+      }
+      const hostId = record?.hostId ?? hostIdOf(target);
       seen.add(hostId);
-      const record = await this.store.get(hostId);
       if (record?.deleteRequestedAt) {
         if (now - record.deleteRequestedAt > REDELETE_AFTER_MS && inst.status !== "STOPPING") {
           this.log(`list: ${hostId} still exists ${Math.round((now - record.deleteRequestedAt) / 1000)} s after destroy; deleting again`);
@@ -577,15 +793,15 @@ export class GcpBenchProvider {
       if (record) await this.store.update(hostId, { lastState: state });
       hosts.push({ hostId, state, expiresAt: iso(expiresAt), labels: info.labels });
     }
-    // Created moments ago and not listed yet, or gone.
-    for (const record of await this.store.list()) {
+    // Created moments ago (or still being sent to a zone) and not listed yet, or gone.
+    for (const record of records) {
       if (seen.has(record.hostId) || record.project !== project) continue;
       if (record.deleteRequestedAt || record.lastState === "gone" || record.lastState === "failed") {
         if (now - (record.deleteRequestedAt ?? record.createdAt) > KEEP_GONE_MS) await this.store.delete(record.hostId);
         continue;
       }
       if (!labelsMatch(record.labels, labels)) continue;
-      if (now - record.createdAt < CREATE_GRACE_MS) {
+      if (now - sentAt(record) < CREATE_GRACE_MS || (record.pendingInsert && now - record.createdAt < CREATE_WINDOW_MS)) {
         hosts.push({ hostId: record.hostId, state: "provisioning", expiresAt: iso(record.expiresAt), labels: record.labels });
       } else {
         await this.store.update(record.hostId, { lastState: "gone" });
@@ -595,8 +811,9 @@ export class GcpBenchProvider {
   }
 
   async destroy({ hostId }: { hostId: string }): Promise<{ ok: boolean }> {
-    const target = parseHostId(hostId);
+    const parsed = parseHostId(hostId);
     const record = await this.store.get(hostId);
+    const target = record ? targetOf(record) : parsed;
     if (record?.deleteRequestedAt && this.now() - record.deleteRequestedAt < REDELETE_AFTER_MS) return { ok: true };
     await this.deleteDetached(target);
     const now = this.now();
@@ -623,7 +840,7 @@ export class GcpBenchProvider {
     const { target, record } = await this.usable(hostId);
     const budget = this.budget();
     const [r, inst] = await Promise.all([
-      this.remote(target, INFO, "info", [], budget.take(25_000, "ssh info"), budget),
+      this.remote(hostId, target, INFO, "info", [], budget.take(25_000, "ssh info"), budget),
       this.describeInstance(target, budget).catch(() => null),
     ]);
     if (r.code !== 0) throw new ProviderError("internal", `info exited ${r.code}: ${clip(r.stderr, 300)}`);
@@ -683,7 +900,7 @@ export class GcpBenchProvider {
     }
     const mode = input.mode === undefined ? "" : input.mode.toString(8).padStart(4, "0");
     const started = this.now();
-    const r = await this.remote(target, PUT, "put", [input.remotePath, mode], budget.take(budget.left(), "putFile"), budget, { stdinFile: input.localPath });
+    const r = await this.remote(input.hostId, target, PUT, "put", [input.remotePath, mode], budget.take(budget.left(), "putFile"), budget, { stdinFile: input.localPath });
     if (r.code !== 0) throw this.remoteFileError(`putFile ${input.remotePath}`, r.stderr);
     const { one } = parseKv(r.stdout.toString("utf8"));
     const remoteBytes = Number(one.get("bytes"));
@@ -719,7 +936,7 @@ export class GcpBenchProvider {
       bytes += b.length;
     };
     try {
-      const r = await this.remote(target, GET, "get", [input.remotePath, String(input.maxBytes)], budget.take(budget.left(), "getFile"), budget, {
+      const r = await this.remote(input.hostId, target, GET, "get", [input.remotePath, String(input.maxBytes)], budget.take(budget.left(), "getFile"), budget, {
         onStdout: (chunk) => {
           if (header !== null) return write(chunk);
           pending = Buffer.concat([pending, chunk]);
@@ -769,7 +986,7 @@ export class GcpBenchProvider {
     const execId = `gx_${randomBytes(10).toString("hex")}`;
     const command = input.argv ?? ["bash", "-lc", input.script ?? ""];
     const args = [execId, String(input.timeoutSeconds), input.cwd ?? ".", String(env.length), ...env.map(([k, v]) => `${k}=${v}`), ...command];
-    const r = await this.remote(target, LAUNCH, "launch", args, budget.take(30_000, "execStart"), budget);
+    const r = await this.remote(input.hostId, target, LAUNCH, "launch", args, budget.take(30_000, "execStart"), budget);
     const out = r.stdout.toString("utf8").trim();
     if (out === "nocwd") throw new ProviderError("invalid", `cwd does not exist on the VM: ${input.cwd}`);
     if (r.code !== 0 || out !== "started") throw new ProviderError("internal", `execStart failed on the VM (exit ${r.code}): ${clip(`${out} ${r.stderr}`, 300)}`);
@@ -781,7 +998,7 @@ export class GcpBenchProvider {
     const execId = this.execId(input.execId);
     const budget = this.budget();
     const maxBytes = Math.max(4, Math.min(MAX_POLL_BYTES, input.maxBytes ?? EXEC_POLL_MAX_BYTES));
-    const r = await this.remote(target, POLL, "poll", [execId, String(input.stdoutOffset), String(input.stderrOffset), String(maxBytes)], budget.take(25_000, "execPoll"), budget, {
+    const r = await this.remote(input.hostId, target, POLL, "poll", [execId, String(input.stdoutOffset), String(input.stderrOffset), String(maxBytes)], budget.take(25_000, "execPoll"), budget, {
       maxStdout: 2 * maxBytes + 64 * 1024,
     });
     if (r.code !== 0) throw new ProviderError("internal", `execPoll failed on the VM (exit ${r.code}): ${clip(r.stderr, 300)}`);
@@ -833,7 +1050,7 @@ export class GcpBenchProvider {
     const { target } = await this.usable(input.hostId);
     const execId = this.execId(input.execId);
     const budget = this.budget();
-    const r = await this.remote(target, CANCEL, "cancel", [execId], budget.take(25_000, "execCancel"), budget);
+    const r = await this.remote(input.hostId, target, CANCEL, "cancel", [execId], budget.take(25_000, "execCancel"), budget);
     const out = r.stdout.toString("utf8").trim();
     if (out === "missing") throw new ProviderError("not_found", `no exec ${execId} on ${target.name}`);
     if (r.code !== 0) throw new ProviderError("internal", `execCancel failed on the VM (exit ${r.code}): ${clip(r.stderr, 300)}`);
@@ -849,8 +1066,9 @@ export class GcpBenchProvider {
 
   /** A VM that can take files and processes: not destroyed, and SSH has worked. */
   private async usable(hostId: string): Promise<{ target: SshTarget; record: HostRecord | null }> {
-    const target = parseHostId(hostId);
+    const parsed = parseHostId(hostId);
     const record = await this.store.get(hostId);
+    const target = record ? targetOf(record) : parsed;
     if (record?.deleteRequestedAt) throw new ProviderError("not_found", `${target.name} was destroyed`);
     if (record && (record.lastState === "gone" || record.lastState === "failed")) throw new ProviderError("not_found", `${target.name} is ${record.lastState}`);
     if (record && !record.readyAt) throw new ProviderError("invalid", `${target.name} is not ready yet (call status until it is)`);
@@ -859,6 +1077,7 @@ export class GcpBenchProvider {
 
   /** ssh, and when the connection fails, ask GCP whether the VM is still there: a gone VM is `[not_found]`. */
   private async remote(
+    hostId: string,
     target: SshTarget,
     script: string,
     name: string,
@@ -875,7 +1094,7 @@ export class GcpBenchProvider {
       if (budget.left() < 5000) throw e;
       const inst = await this.describeInstance(target, budget).catch(() => undefined);
       if (inst === null) {
-        await this.store.update(hostIdOf(target), { lastState: "gone" });
+        await this.store.update(hostId, { lastState: "gone" });
         throw new ProviderError("not_found", `${target.name} no longer exists`);
       }
       if (inst && inst.status !== "RUNNING") throw new ProviderError("not_found", `${target.name} is ${inst.status}`);

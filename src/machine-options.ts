@@ -26,6 +26,8 @@ export interface GcpMachine {
   bootDiskThroughput?: number;
   spot?: boolean;
   zone?: string;
+  /** Zones to try in order, canonical: comma-separated, no spaces, no repeats. */
+  zones?: string;
   networkTier?: "PREMIUM" | "STANDARD";
 }
 
@@ -33,7 +35,23 @@ type Raw = string | number | boolean;
 type Parser = (value: Raw, name: string) => unknown;
 
 const ZONE_RE = /^[a-z]+-[a-z]+[0-9]+-[a-z]$/u;
+/** At most this many zones in a zone list. */
+export const MAX_ZONES = 16;
 const RESOURCE_RE = /^[a-z][a-z0-9-]{0,62}$/u;
+
+/**
+ * A zone list ("us-central1-a, us-central1-f", commas or spaces between):
+ * the zones in order, each once. Throws an Error naming what is wrong.
+ */
+export function parseZoneList(text: string): string[] {
+  const out: string[] = [];
+  for (const zone of text.split(/[\s,]+/u).filter((z) => z !== "")) {
+    if (!ZONE_RE.test(zone)) throw new Error(`not a zone: ${JSON.stringify(zone.slice(0, 40))}`);
+    if (!out.includes(zone)) out.push(zone);
+  }
+  if (out.length > MAX_ZONES) throw new Error(`at most ${MAX_ZONES} zones`);
+  return out;
+}
 
 function bad(name: string, want: string, value: Raw): ProviderError {
   return new ProviderError("invalid", `machine option ${name} must be ${want}, got ${JSON.stringify(value)}`);
@@ -139,8 +157,22 @@ export const GCP_MACHINE_OPTIONS: Record<keyof GcpMachine, Spec> = {
     parse: bool,
   },
   zone: {
-    description: "Zone for this VM, such as us-central1-b (in the provider's project); default: the zone setting. For machine types or platforms only some zones have.",
+    description: "Zone for this VM, such as us-central1-b (in the provider's project); default: the zones or zone setting. For machine types or platforms only some zones have. zones wins over it.",
     parse: pattern(ZONE_RE, "a zone such as us-central1-a"),
+  },
+  zones: {
+    description:
+      'Zones to try in order, comma-separated, such as "us-central1-a,us-central1-b,us-central1-f": create (and status, for a create GCP fails later) moves on to the next zone when one is out of capacity (ZONE_RESOURCE_POOL_EXHAUSTED). Wins over zone and the zones and zone settings.',
+    parse: (v, name) => {
+      let zones: string[];
+      try {
+        zones = typeof v === "string" ? parseZoneList(v) : [];
+      } catch {
+        throw bad(name, `zones such as "us-central1-a,us-central1-f" (at most ${MAX_ZONES})`, v);
+      }
+      if (zones.length === 0) throw bad(name, `zones such as "us-central1-a,us-central1-f" (at most ${MAX_ZONES})`, v);
+      return zones.join(",");
+    },
   },
   networkTier: {
     description: "PREMIUM or STANDARD network tier of the external IP (gcloud --network-tier).",

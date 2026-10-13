@@ -14,6 +14,7 @@ import { BENCH_PROVIDER_CALLER, benchProviderContract } from "./src/contract.ts"
 import { ProviderError, asProviderError } from "./src/errors.ts";
 import { Tools } from "./src/gcloud.ts";
 import { parseExtraLabels, validNamePrefix, validPrefix } from "./src/labels.ts";
+import { MAX_ZONES, parseZoneList } from "./src/machine-options.ts";
 import { STANDARD_SIZES } from "./src/machine-types.ts";
 import { runProcess, type Runner } from "./src/proc.ts";
 import { GcpBenchProvider, type Settings } from "./src/provider.ts";
@@ -43,7 +44,20 @@ export function createPlugin(deps: PluginDeps = {}) {
   return async function plugin(bb: BbPluginApi): Promise<void> {
     const settings = bb.settings.define({
       project: text("GCP project", "Project the VMs are created in. Empty: gcloud's configured project (gcloud config get-value project).", "", z.string().regex(/^$|^[a-z][a-z0-9.:-]{3,62}[a-z0-9]$/u, "A GCP project id")),
-      zone: text("Zone", "Compute Engine zone, such as us-central1-a. Empty: gcloud's compute/zone.", "", z.string().regex(/^$|^[a-z]+-[a-z]+[0-9]+-[a-z]$/u, "A zone such as us-central1-a")),
+      zone: text("Zone", "Compute Engine zone, such as us-central1-a. Empty: gcloud's compute/zone. The zones setting wins over it.", "", z.string().regex(/^$|^[a-z]+-[a-z]+[0-9]+-[a-z]$/u, "A zone such as us-central1-a")),
+      zones: text(
+        "Zones, in order",
+        "Zones to try in order, comma-separated, such as us-central1-a,us-central1-b,us-central1-f. When GCP says a zone is out of capacity for the machine (ZONE_RESOURCE_POOL_EXHAUSTED), the create moves on to the next. Empty: just the zone setting. Which zones a VM uses, first set wins: the machine options zones, then zone, then this setting, then the zone setting, then gcloud's compute/zone.",
+        "",
+        z.string().refine((v) => {
+          try {
+            parseZoneList(v);
+            return true;
+          } catch {
+            return false;
+          }
+        }, `Zones such as us-central1-a,us-central1-f (at most ${MAX_ZONES})`),
+      ),
       account: text("gcloud account", "Run gcloud as this account (--account). Empty: gcloud's active account.", ""),
       machineSeries: text("Machine series", `Series for <series>-standard-<n> machine types (the smallest size with at least the cores asked for). Known sizes: ${Object.keys(STANDARD_SIZES).join(", ")}.`, "n2", z.string().regex(/^[a-z][a-z0-9]{1,9}$/u, "A machine series such as n2, c3d or t2d")),
       machineTypes: {
@@ -60,7 +74,7 @@ export function createPlugin(deps: PluginDeps = {}) {
         options: ["default", "1", "2"],
         default: "default",
       },
-      imageFamily: text("Image family", "Boot image family.", "debian-12", z.string().regex(/^[a-z][a-z0-9-]{0,62}$/u, "An image family")),
+      imageFamily: text("Image family", "Boot image family. The default, debian-13, has glibc 2.41: toolchains built with current Nix need glibc 2.39 or newer, which Debian 12 (glibc 2.36) doesn't have.", "debian-13", z.string().regex(/^[a-z][a-z0-9-]{0,62}$/u, "An image family")),
       imageProject: text("Image project", "Project that holds the image family.", "debian-cloud", z.string().regex(/^[a-z][a-z0-9.:-]{3,62}$/u, "A project id")),
       bootDiskSizeGb: { type: "number" as const, label: "Boot disk size (GB)", default: 20, experimental_schema: z.number().int().min(10).max(2000) },
       bootDiskType: text("Boot disk type", "Empty: pd-balanced, or hyperdisk-balanced for series that need it (n4, c4, ...).", "", z.string().regex(/^$|^[a-z][a-z0-9-]{1,62}$/u, "A disk type")),
@@ -95,6 +109,7 @@ export function createPlugin(deps: PluginDeps = {}) {
       return {
         project: s.project,
         zone: s.zone,
+        zones: s.zones,
         account: s.account,
         machineSeries: s.machineSeries,
         machineTypes: s.machineTypes,

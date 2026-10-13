@@ -5,6 +5,13 @@
 //   $FAKE_GCP_STATE/config.json   account, project, zone, timings, injected failures
 //   $FAKE_GCP_STATE/calls.jsonl   one line per invocation (tool, argv)
 //   $FAKE_GCP_STATE/vms/<name>.json, vms/<name>/home/   instance JSON and the VM's home
+//   $FAKE_GCP_STATE/vms/<name>@<zone>.json   what a stockout left of a VM in a zone
+//
+// A VM is found only in its own zone (--zone), as in GCP. config.stockouts
+// makes a zone out of capacity: { "<zone>": { how, code?, message?, opMs?, sleepMs? } }
+// with how = "sync" (create fails at once), "op" (create starts; its operation
+// fails after opMs) or "stops" (as "op", and the VM shows STOPPING meanwhile).
+// config.holdOps keeps every operation RUNNING until it is unset.
 //
 // Every invocation re-reads the state, so tests change it between calls.
 import { spawn } from "node:child_process";
@@ -67,6 +74,19 @@ mkdirSync(vmsDir, { recursive: true });
 const vmPath = (name) => join(vmsDir, `${name}.json`);
 const notFound = (kind, name) =>
   fail(`ERROR: (gcloud.compute.${kind}.describe) Could not fetch resource:\n - The resource 'projects/${flags.project}/zones/${flags.zone}/${kind}/${name}' was not found`);
+const zoneOf = (vm) => String(vm.zone ?? "").split("/").pop();
+
+/** The VM of that name in that zone: the live one, or what a stockout left there. */
+function findVm(name, zone) {
+  const vm = loadVm(name);
+  if (vm && zoneOf(vm) === zone) return { vm, file: name };
+  const left = loadVm(`${name}@${zone}`);
+  return left ? { vm: left, file: `${name}@${zone}` } : null;
+}
+
+function writeOp(opName, op) {
+  writeFileSync(join(STATE, `${opName}.op.json`), JSON.stringify({ name: opName, zone: flags.zone, ...op }));
+}
 
 /** The instance as GCP would show it now (status advances with time). */
 function view(vm) {
@@ -144,11 +164,20 @@ switch (command) {
   }
   case "compute instances create": {
     const name = positional[3];
-    if (loadVm(name)) fail(`ERROR: (gcloud.compute.instances.create) Could not fetch resource:\n - The resource 'projects/${flags.project}/zones/${flags.zone}/instances/${name}' already exists`);
+    if (findVm(name, flags.zone)) fail(`ERROR: (gcloud.compute.instances.create) Could not fetch resource:\n - The resource 'projects/${flags.project}/zones/${flags.zone}/instances/${name}' already exists`);
     if (config.createError) fail(config.createError);
     const opName = `operation-${now}-${Math.random().toString(16).slice(2, 10)}`;
-    if (config.createOpError) {
-      writeFileSync(join(STATE, `${opName}.op.json`), JSON.stringify({ name: opName, status: "DONE", error: { errors: [config.createOpError] } }));
+    const stockout = config.stockouts?.[flags.zone];
+    if (stockout?.sleepMs) sleepSync(stockout.sleepMs);
+    const stockoutError = stockout && {
+      code: stockout.code ?? "ZONE_RESOURCE_POOL_EXHAUSTED",
+      message: stockout.message ?? `The zone 'projects/${flags.project}/zones/${flags.zone}' does not have enough resources available to fulfill the request.  '(resource type:compute)'.`,
+    };
+    if (stockout?.how === "sync") fail(`ERROR: (gcloud.compute.instances.create) Could not fetch resource:\n - ${stockoutError.message}`);
+    const live = loadVm(name);
+    if (live && !stockout && !config.createOpError) fail(`the fake keeps one live VM per name (${name} is in ${zoneOf(live)})`);
+    if (config.createOpError || stockout?.how === "op") {
+      writeOp(opName, { status: "DONE", error: { errors: [stockoutError ?? config.createOpError] }, _doneAt: now + (stockout?.opMs ?? 0) });
     } else {
       const labels = Object.fromEntries(
         String(flags.labels ?? "")
@@ -186,6 +215,13 @@ switch (command) {
         _project: flags.project,
         _flags: flags,
       };
+      if (stockout?.how === "stops") {
+        // GCP could not place it: it shows STOPPING (and goes away) while the insert operation fails.
+        writeFileSync(join(vmsDir, `${name}@${flags.zone}.json`), JSON.stringify({ ...vm, status: "STOPPING" }, null, 2));
+        writeOp(opName, { status: "DONE", error: { errors: [stockoutError] }, _doneAt: now + (stockout.opMs ?? 0) });
+        print([{ name: opName, operationType: "insert", status: "PENDING" }]);
+        break;
+      }
       if (config.reportTerminationTime && Number.isFinite(seconds)) vm.scheduling.terminationTime = new Date(runningAt + seconds * 1000).toISOString();
       writeFileSync(vmPath(name), JSON.stringify(vm, null, 2));
       mkdirSync(join(vmsDir, name, "home"), { recursive: true });
@@ -201,11 +237,11 @@ switch (command) {
         });
         child.unref();
       }
-      writeFileSync(join(STATE, `${opName}.op.json`), JSON.stringify({ name: opName, status: "DONE" }));
+      writeOp(opName, { status: "DONE" });
       // A stockout after the instance exists: GCP shows it STOPPING, and the insert operation carries the error.
       if (config.createStopsWith) {
         writeFileSync(vmPath(name), JSON.stringify({ ...vm, status: "STOPPING" }, null, 2));
-        writeFileSync(join(STATE, `${opName}.op.json`), JSON.stringify({ name: opName, status: "DONE", error: { errors: [config.createStopsWith] } }));
+        writeOp(opName, { status: "DONE", error: { errors: [config.createStopsWith] } });
       }
     }
     print([{ name: opName, operationType: "insert", status: "PENDING", targetLink: `https://www.googleapis.com/compute/v1/projects/${flags.project}/zones/${flags.zone}/instances/${name}` }]);
@@ -213,9 +249,9 @@ switch (command) {
     break;
   }
   case "compute instances describe": {
-    const vm = loadVm(positional[3]);
-    if (!vm) notFound("instances", positional[3]);
-    print(view(vm));
+    const found = findVm(positional[3], flags.zone);
+    if (!found) notFound("instances", positional[3]);
+    print(view(found.vm));
     break;
   }
   case "compute instances list": {
@@ -232,9 +268,10 @@ switch (command) {
   }
   case "compute instances delete": {
     const name = positional[3];
-    if (!loadVm(name)) fail(`ERROR: (gcloud.compute.instances.delete) Could not fetch resource:\n - The resource 'projects/${flags.project}/zones/${flags.zone}/instances/${name}' was not found`);
+    const found = findVm(name, flags.zone);
+    if (!found) fail(`ERROR: (gcloud.compute.instances.delete) Could not fetch resource:\n - The resource 'projects/${flags.project}/zones/${flags.zone}/instances/${name}' was not found`);
     if (config.deleteSleepMs) sleepSync(config.deleteSleepMs);
-    removeVm(name);
+    removeVm(found.file);
     process.stderr.write(`Deleted [https://www.googleapis.com/compute/v1/projects/${flags.project}/zones/${flags.zone}/instances/${name}].\n`);
     break;
   }
@@ -249,13 +286,14 @@ switch (command) {
   }
   case "compute operations describe": {
     const op = readJson(join(STATE, `${positional[3]}.op.json`), null);
-    if (!op) notFound("operations", positional[3]);
-    print(op);
+    if (!op || (op.zone && op.zone !== flags.zone)) notFound("operations", positional[3]);
+    const { _doneAt, ...shown } = op;
+    print(config.holdOps || (_doneAt && now < _doneAt) ? { name: op.name, zone: op.zone, status: "RUNNING" } : shown);
     break;
   }
   case "compute ssh": {
     const [user, name] = String(positional[2]).split("@");
-    const vm = loadVm(name);
+    const vm = findVm(name, flags.zone)?.vm;
     if (!vm) notFound("instances", name);
     if (!flags["dry-run"]) fail("the fake only supports --dry-run");
     const loginUser = config.osLoginUser ?? user;

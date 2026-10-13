@@ -28,7 +28,9 @@ machine = { type = "c4d-standard-16", threadsPerCore = 1 }   # optional; see "Pr
    reads, stores or forwards a token. To use another account than the active
    one, set `account`.
 3. **Pick a project and zone**: set `project` and `zone`, or leave them empty
-   to use `gcloud config get-value project` and `compute/zone`. The Compute
+   to use `gcloud config get-value project` and `compute/zone`. For machine
+   types that sell out (C4D, C4, ...), set `zones` to several zones instead;
+   see [Zones and stockouts](#zones-and-stockouts). The Compute
    Engine API must be enabled (`gcloud services enable compute.googleapis.com`)
    and your account needs to create VMs there (for example
    `roles/compute.instanceAdmin.v1`).
@@ -79,8 +81,8 @@ on them can't act on your project.
 | Method | What it does |
 |---|---|
 | `describe` | Checks that gcloud and ssh exist, a project and zone are set, an account is logged in, and `gcloud compute zones describe` works (cached for 5 minutes; failures for 30 s). Reports `available: false` with the reason otherwise. Lists the machine options `create` accepts in `machineOptions`. |
-| `create` | `gcloud compute instances create <prefix>-<hash of key> --async` with the machine type, image, disk, network, labels, metadata, max run duration and termination action, and the flags of any [machine options](#production-like-nodes) (an unknown option is `[invalid] unknown machine option <key>`). Returns `provisioning` within seconds. The VM name derives from the idempotency key and the machine options, so a repeated key with the same options returns the same VM, even after a lost response or a reinstall ("already exists" is adopted when the VM carries the same key and options); the same key with other options is another VM. |
-| `status` | `gcloud compute instances describe`. `PROVISIONING`/`STAGING` → `provisioning`; `RUNNING` → one ssh probe, `ready` once it answers and the startup script has installed `packages` (kept, so later calls are a single describe); `STOPPING`/`TERMINATED`/`SUSPENDED` → `suspended` (or `gone` at the end of the lifetime); `REPAIRING` → `failed`; missing → `gone`, or `failed` with GCP's reason when the create operation failed (`gcloud compute operations describe`), as is a new VM GCP stops before it was ever ready because its create failed (a stockout shows that way). A VM started again since SSH worked is `suspended`: it may be on different hardware. Running without working SSH for `readyTimeoutMinutes` → `failed`. |
+| `create` | `gcloud compute instances create <prefix>-<hash of key> --async` with the machine type, image, disk, network, labels, metadata, max run duration and termination action, and the flags of any [machine options](#production-like-nodes) (an unknown option is `[invalid] unknown machine option <key>`), in the first of its [zones](#zones-and-stockouts), and in the next one when GCP says a zone is out of capacity. Returns `provisioning` within seconds. The VM name derives from the idempotency key and the machine options, so a repeated key with the same options returns the same VM, even after a lost response or a reinstall ("already exists" is adopted when the VM carries the same key and options); the same key with other options is another VM. |
+| `status` | `gcloud compute instances describe`. `PROVISIONING`/`STAGING` → `provisioning`; `RUNNING` → one ssh probe, `ready` once it answers and the startup script has installed `packages` (kept, so later calls are a single describe); `STOPPING`/`TERMINATED`/`SUSPENDED` → `suspended` (or `gone` at the end of the lifetime); `REPAIRING` → `failed`; missing → `gone`, or `failed` with GCP's reason when the create operation failed (`gcloud compute operations describe`), as is a new VM GCP stops before it was ever ready because its create failed (a stockout shows that way). A create that failed for a stockout is sent to the next zone instead, and the host stays `provisioning` meanwhile; `failed` once every zone was out of capacity. A VM started again since SSH worked is `suspended`: it may be on different hardware. Running without working SSH for `readyTimeoutMinutes` → `failed`. |
 | `list` | `gcloud compute instances list --filter="labels.<prefix>-managed=true AND labels.<prefix>_<key>=<value>…"` across all zones of the project, then an exact match on the caller's labels kept verbatim in metadata. Only VMs carrying the provider's label are ever listed. |
 | `destroy` | `gcloud compute instances delete`, started detached (a delete takes a minute or two, longer than an RPC may run); `ok: true` at once, and the VM is `gone` from then on. Idempotent. If the VM is still there 3 minutes later, `list` sends the delete again. |
 | `info` | One ssh round trip: `uname`, `/etc/os-release`, `/proc/cpuinfo`, `nproc`, `lscpu`, `/proc/meminfo`, cgroup `cpu.max`/`memory.max`, `git --version`; plus, in `extra`, the machine type, CPU platform, minimum CPU platform, threads per core, vCPUs, turbo mode, performance monitoring unit and provisioning model from the VM and `describe`, the machine options it was created with, and `machineNote` when the VM has more vCPUs or less memory than asked for. With no cgroup quota the CPU quota is the VM's vCPUs. |
@@ -117,7 +119,7 @@ and processes are polled. Uploads come from bb-autoresearch in 32 MiB parts.
 
 **Errors.** gcloud's and ssh's failures map to the contract's codes: quota
 and stockouts (`ZONE_RESOURCE_POOL_EXHAUSTED`, `Quota '…' exceeded`) are
-`[capacity]`; missing logins, expired credentials and missing permissions
+`[capacity]` (a stockout only once every zone was out of capacity); missing logins, expired credentials and missing permissions
 are `[auth]`; a missing VM or exec is `[not_found]` (a failed SSH connection
 asks GCP whether the VM still exists); rate limits, internal errors and
 timeouts are `[transient]`; bad settings (machine type, image, disabled API)
@@ -128,11 +130,12 @@ are `[invalid]`.
 | Setting | Default | Meaning |
 |---|---|---|
 | `project`, `zone` | gcloud's config | Where VMs are created. |
+| `zones` | none | Zones to try in order, comma-separated (`us-central1-a,us-central1-b,us-central1-f`); wins over `zone`. See [Zones and stockouts](#zones-and-stockouts). |
 | `account` | gcloud's active account | `--account` for every gcloud call. |
 | `machineSeries` | `n2` | Series for `<series>-standard-<n>`. |
 | `machineTypes` | none | JSON, core count → machine type, e.g. `{"8": "c3d-standard-8"}`. Wins over the series. |
 | `threadsPerCore` | `default` | `1` turns SMT off (`--threads-per-core=1`). The `threadsPerCore` machine option sets it per VM. |
-| `imageFamily`, `imageProject` | `debian-12`, `debian-cloud` | Boot image. bb-autoresearch needs bash, tar and git 2.38 or newer; Debian 12's cloud image has no git, so `packages` installs it (2.39). |
+| `imageFamily`, `imageProject` | `debian-13`, `debian-cloud` | Boot image. Debian 13 because of its glibc (2.41): toolchains packed from current Nix need glibc 2.39 or newer, and Debian 12's 2.36 can't run them. bb-autoresearch needs bash, tar and git 2.38 or newer; Debian's cloud image has no git, so `packages` installs it (2.47). For another image set both (Debian 12: `debian-12`; Ubuntu 24.04: `ubuntu-2404-lts-amd64` in `ubuntu-os-cloud`; Arm series such as t2a and c4a need an arm64 family such as `debian-13-arm64`), or per VM with the `imageFamily` and `imageProject` machine options. |
 | `bootDiskSizeGb`, `bootDiskType` | 20, auto | `pd-balanced`, or `hyperdisk-balanced` for series that boot only from Hyperdisk (n4, c4, …). |
 | `network`, `subnet` | default | VPC placement. |
 | `externalIp` | on | Off: `--no-address`. |
@@ -206,7 +209,8 @@ machine = { type = "c3-standard-8", zone = "us-central1-b", imageFamily = "ubunt
 | `bootDiskType` | `--boot-disk-type` | Such as `pd-ssd` or `hyperdisk-balanced`. Default: `pd-balanced`, or `hyperdisk-balanced` for series that need it. |
 | `bootDiskIops`, `bootDiskThroughput` | `--boot-disk-provisioned-iops`, `--boot-disk-provisioned-throughput` | Provisioned IOPS and MB/s of a Hyperdisk (or pd-extreme) boot disk. |
 | `spot` | `--provisioning-model` | `true`: a Spot VM; `false`: standard, whatever `provisioningModel` says. |
-| `zone` | `--zone` | Zone for this VM, in the provider's project. The host id carries it. |
+| `zone` | `--zone` | Zone for this VM, in the provider's project. The host id carries it. No fallback: wins over the `zones` and `zone` settings. |
+| `zones` | `--zone` | Zones for this VM, tried in order, comma-separated: `zones = "us-central1-a,us-central1-b,us-central1-f"` (a TOML string; options can't be arrays). Wins over `zone` and the settings. See [Zones and stockouts](#zones-and-stockouts). |
 | `networkTier` | `--network-tier` | `PREMIUM` or `STANDARD`, for the external IP. |
 
 Values may be TOML numbers, booleans or strings (`threadsPerCore = 1` and
@@ -230,6 +234,62 @@ adopts the old one. Without options, names are what they were before.
 `cpuPlatform` (for example `AMD Turin`), `threadsPerCore` (the guest's
 `lscpu`), `vcpus`, and the options. bb-autoresearch records it with each
 measurement.
+
+### Zones and stockouts
+
+GCP sells out of popular machine types zone by zone: a create of a C4D can
+fail with `ZONE_RESOURCE_POOL_EXHAUSTED` (or
+`ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS`, "does not have enough resources
+available", "currently unavailable in the … zone") in us-central1-a, -b and
+-c while -f has capacity. Give a VM several zones and `create` tries them in
+order, moving on only when GCP says a zone is out of capacity:
+
+```sh
+# Every VM:
+bb plugin config bench-provider-gcp set zones us-central1-a,us-central1-b,us-central1-f
+```
+
+```toml
+# One [[oracle.remote_bench]] entry:
+machine = { type = "c4d-standard-16", threadsPerCore = 1, zones = "us-central1-a,us-central1-b,us-central1-f" }
+```
+
+Which zones a VM may use, first that is set wins:
+
+1. the `zones` machine option,
+2. the `zone` machine option (that zone only, no fallback),
+3. the `zones` setting,
+4. the `zone` setting,
+5. gcloud's `compute/zone`.
+
+How it goes:
+
+- **GCP refuses the create at once**: `create` sends it to the next zone in
+  the same call. The host id names the zone that took it.
+- **GCP takes the create and fails it later** (the usual way with
+  `--async`: the insert operation ends with the stockout, and the VM may
+  show `STOPPING` meanwhile): `status` sees it in the operation, deletes
+  what GCP left of the VM and sends the create to the next zone, reporting
+  `provisioning` throughout (detail
+  `creating in us-central1-f (us-central1-a, us-central1-b were out of capacity)`).
+  The host id doesn't change, so it keeps the zone the create was first sent
+  to; the provider remembers where the VM really is, and every method uses
+  that. `info`'s `extra.zone` is the zone the VM runs in.
+- **Every zone out of capacity**: `create` fails with
+  `[capacity] … every zone is out of capacity (us-central1-a: …; us-central1-b: …)`
+  (bb-autoresearch retries later), or `status` reports `failed` with the
+  same list.
+- **Within the 55 s budget**: a further zone is tried within a call only
+  while a quarter of its budget is left; otherwise the call returns
+  `provisioning` and the next `status` call sends the create there.
+
+Other failures stop the fallback: a zone that lacks the machine type, an
+image or a quota says so as before (`[invalid]`, `[capacity]`), naming the
+zone and the zones that were out of capacity before it. Quotas are per
+region, so list zones in one region, or in regions where you have quota;
+with the `subnet` setting, in that subnet's region. The VM's name, labels,
+metadata and lifetime are the same in every zone (the lifetime counts from
+the first create).
 
 ### Labels
 
@@ -261,6 +321,10 @@ out of C4D capacity, which `status` reported as `failed` with GCP's
 create; `info` reported `c4d-standard-8`, CPU platform `AMD Turin`
 (`AMD EPYC 9B45`), 1 thread per core and 4 vCPUs. Every VM was deleted.
 
+The zone fallback added in 0.2.1 (`zones`) is covered by the tests' fake
+gcloud (a zone refusing the create, a create operation failing later, a VM
+GCP shows `STOPPING`), not by a live run yet.
+
 ## Development
 
 ```sh
@@ -271,7 +335,7 @@ bb plugin build
 ```
 
 The tests drive the plugin through BB's fake plugin host. `test/fake/` holds a
-fake `gcloud` (instances, operations, machine types, `compute ssh --dry-run`) and a fake
+fake `gcloud` (instances, operations, machine types, zone stockouts, `compute ssh --dry-run`) and a fake
 `ssh` that runs remote commands with bash in a per-VM directory, so every
 remote script runs for real. `src/contract.ts` is a copy of bb-autoresearch's
 `src/bench-provider/contract.ts`; a test checks its fingerprint.

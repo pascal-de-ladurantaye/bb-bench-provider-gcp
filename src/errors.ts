@@ -31,6 +31,15 @@ export function clip(text: string, max = 600): string {
   return `${t.slice(0, half)} … ${t.slice(-half)}`;
 }
 
+/**
+ * A zone out of capacity for the machine asked for (a stockout), as GCP says
+ * it in gcloud's stderr or a create operation's error: another zone may have
+ * it. Quota errors are not stockouts (quotas are per region or project).
+ */
+export function isStockout(text: string): boolean {
+  return /ZONE_RESOURCE_POOL_EXHAUSTED|RESOURCE_POOL_EXHAUSTED|does not have enough resources available|resource pool exhausted|STOCKOUT|is currently unavailable in the [a-z0-9-]+ zone/iu.test(text);
+}
+
 export const LOGIN_HINT = "Run `gcloud auth login` (and `gcloud auth list` to check the active account), then retry.";
 
 /**
@@ -43,7 +52,7 @@ export function mapGcloudError(what: string, stderr: string): ProviderError {
   const say = `${what}: ${text || "gcloud failed without a message"}`;
   const has = (re: RegExp) => re.test(stderr);
 
-  if (has(/ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available|resource pool exhausted|STOCKOUT|QUOTA_EXCEEDED|Quota '[^']+' exceeded|quota exceeded|rateLimitExceeded.*quota/iu)) {
+  if (isStockout(stderr) || has(/QUOTA_EXCEEDED|Quota '[^']+' exceeded|quota exceeded|rateLimitExceeded.*quota/iu)) {
     return new ProviderError("capacity", say);
   }
   if (has(/was not found|notFound|HTTPError 404|code=404|could not fetch resource:.*not found/iu) && !has(/project .* not found|Unknown zone|Invalid value for field/iu)) {

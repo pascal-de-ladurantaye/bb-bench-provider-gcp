@@ -103,7 +103,7 @@ describe("create", () => {
     expect(argv).toContain("--no-scopes");
     expect(flag(argv!, "max-run-duration")).toBe("5400s");
     expect(flag(argv!, "machine-type")).toBe("n2-standard-8");
-    expect(flag(argv!, "image-family")).toBe("debian-12");
+    expect(flag(argv!, "image-family")).toBe("debian-13");
     expect(flag(argv!, "boot-disk-type")).toBe("pd-balanced");
     expect(flag(argv!, "provisioning-model")).toBe("STANDARD");
 

@@ -7,11 +7,33 @@ import { createHash } from "node:crypto";
 import type { HostState } from "./contract.ts";
 import type { GcpMachine } from "./machine-options.ts";
 
+/**
+ * What it takes to send a create again in another zone: gcloud compute
+ * instances create's flags without the name, project, zone, metadata files,
+ * max run duration and output flags, and the metadata as key → content.
+ */
+export interface InsertPlan {
+  args: string[];
+  metadata: Record<string, string>;
+}
+
 export interface HostRecord {
+  /** The id the caller holds. Its zone is where create first sent the VM; `zone` is where it is now. */
   hostId: string;
   project: string;
+  /** The VM's zone: the host id's, unless a stockout moved the create on to another zone. */
   zone: string;
   name: string;
+  /** The zones the create may use, in order (missing: just `zone`). */
+  zones?: string[];
+  /** `<zone>: <GCP's reason>` for each zone found out of capacity so far. */
+  stockouts?: string[];
+  /** The create, to send again in the next zone (kept while there is one). */
+  plan?: InsertPlan;
+  /** The create still has to be sent to `zone` (the previous call ran out of time). */
+  pendingInsert?: boolean;
+  /** When the create was last sent (ms; missing: createdAt). */
+  insertedAt?: number;
   /** The idempotency identity: the create's key, plus its machine options when it had any. */
   key: string;
   labels: Record<string, string>;
