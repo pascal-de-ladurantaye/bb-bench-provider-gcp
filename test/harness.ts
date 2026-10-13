@@ -140,8 +140,17 @@ export class FakeCloud {
     rmSync(this.vmPath(name), { force: true });
   }
 
-  /** Kill what the fake VMs still run (a test's sleeps), then remove everything. */
+  /** Kill what the fake VMs still run (startup scripts, a test's sleeps), then remove everything. */
   cleanup(): void {
+    // A startup script still running would write into the VM's directory while it is removed.
+    const startups = join(this.state, "startup.pids");
+    for (const pid of existsSync(startups) ? readFileSync(startups, "utf8").split("\n").filter(Boolean) : []) {
+      try {
+        process.kill(-Number(pid), "SIGKILL");
+      } catch {
+        // done already
+      }
+    }
     const vms = join(this.state, "vms");
     for (const name of existsSync(vms) ? readdirSync(vms) : []) {
       const execs = join(vms, name, "home", ".bb-bench-gcp", "exec");

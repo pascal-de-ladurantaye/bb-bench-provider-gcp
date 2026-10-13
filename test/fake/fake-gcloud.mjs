@@ -235,6 +235,8 @@ switch (command) {
           stdio: "ignore",
           env: { ...process.env, BB_BENCH_GCP_SETUP_DIR: join(vmsDir, name, "setup"), BB_BENCH_GCP_RETRY_SECONDS: "0" },
         });
+        // Its own process group (detached): the harness kills it before removing the state.
+        if (child.pid) appendFileSync(join(STATE, "startup.pids"), `${child.pid}\n`);
         child.unref();
       }
       writeOp(opName, { status: "DONE" });
