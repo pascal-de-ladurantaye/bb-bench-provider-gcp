@@ -13,8 +13,8 @@ describe("contract copy", () => {
   it("is bb-autoresearch's contract v1, unchanged below the header", () => {
     const text = readFileSync(new URL("../src/contract.ts", import.meta.url), "utf8");
     const body = text.split("\n").slice(4).join("\n");
-    // sha256 of contract v1 with the machine options of bb-autoresearch 1.0 (create's `machine`, describe's `machineOptions`).
-    expect(createHash("sha256").update(body).digest("hex")).toBe("cf9f22cb70d2fbff70244159d639409404b5cfb1eba6a998919a66df3f9aa89d");
+    // sha256 of bb-autoresearch 1.0.0's src/bench-provider/contract.ts (contract v1 with create's `machine` and describe's `machineOptions`).
+    expect(createHash("sha256").update(body).digest("hex")).toBe("3d02b208bde2c491522f2ef92e0d0b603a29ea0d4d9d2a81927c83ce9ef56003");
   });
 });
 
