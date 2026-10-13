@@ -93,3 +93,29 @@ export function chooseMachineType(series: string, cores: number, memoryGb: numbe
   }
   return `${series}-standard-${size}`;
 }
+
+/** Series whose vCPUs are whole cores already (no SMT): threadsPerCore 1 changes nothing there. */
+const ONE_THREAD_SERIES = new Set(["t2a", "t2d", "c4a", "n4a", "h3", "h4d"]);
+
+/** Hardware threads per core a series has by default (2 for most x86 series). */
+export function defaultThreadsPerCore(machineType: string): 1 | 2 {
+  return ONE_THREAD_SERIES.has(seriesOf(machineType)) ? 1 : 2;
+}
+
+/** A custom type's shape from its name (`n2-custom-8-16384`, `custom-4-10240-ext`); GCP lists no such type. */
+export function customShape(machineType: string): { guestCpus: number; memoryMb: number } | null {
+  const m = /^(?:[a-z][a-z0-9]*-)?custom-(\d+)-(\d+)(?:-ext)?$/u.exec(machineType);
+  return m ? { guestCpus: Number(m[1]), memoryMb: Number(m[2]) } : null;
+}
+
+/**
+ * The vCPUs a VM of `machineType` (with `guestCpus` by default) shows its
+ * guest with these advanced machine features: threadsPerCore 1 halves a
+ * two-thread series, and visibleCoreCount sets the physical cores.
+ */
+export function effectiveVcpus(machineType: string, guestCpus: number, threadsPerCore?: 1 | 2, visibleCoreCount?: number): number {
+  const base = defaultThreadsPerCore(machineType);
+  const threads = Math.min(threadsPerCore ?? base, base);
+  const physical = visibleCoreCount ?? Math.max(1, Math.floor(guestCpus / base));
+  return physical * threads;
+}

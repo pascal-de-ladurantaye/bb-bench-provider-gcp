@@ -46,6 +46,7 @@ describe("describe", () => {
       maxHosts: 3,
       maxLifetimeSeconds: 7200,
       cores: { min: 1, max: 16 },
+      machineOptions: expect.arrayContaining([expect.objectContaining({ name: "type" })]),
     });
     expect(cloud.gcloudCalls("compute zones describe")[0]).toContain("--project=test-project");
   });
@@ -284,6 +285,14 @@ describe("status", () => {
     const st = await call<{ state: string; detail: string }>("status", { hostId });
     expect(st.state).toBe("failed");
     expect(st.detail).toMatch(/ZONE_RESOURCE_POOL_EXHAUSTED/);
+  });
+
+  it("reports failed when GCP stops a new VM it could not place, with GCP's reason", async () => {
+    cloud.set({ createStopsWith: { code: "ZONE_RESOURCE_POOL_EXHAUSTED", message: "The zone does not have enough resources available to fulfill the request." } });
+    const { call } = await load(cloud);
+    const { hostId } = await call<{ hostId: string }>("create", { key: "a", cores: 2, lifetimeSeconds: 600, labels: {} });
+    const st = await call<{ state: string; detail: string }>("status", { hostId });
+    expect(st).toMatchObject({ state: "failed", detail: expect.stringMatching(/create failed: ZONE_RESOURCE_POOL_EXHAUSTED/) });
   });
 
   it("reports failed when SSH never works", async () => {

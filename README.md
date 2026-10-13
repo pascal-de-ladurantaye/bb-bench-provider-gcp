@@ -14,6 +14,7 @@ provider = "bench-provider-gcp"
 hosts = 2
 cores = 8                 # vCPUs; see "Machine types"
 lifetime_minutes = 120    # capped by the maxLifetimeMinutes setting
+machine = { type = "c4d-standard-16", threadsPerCore = 1 }   # optional; see "Production-like nodes"
 ```
 
 ## Setup
@@ -77,12 +78,12 @@ on them can't act on your project.
 
 | Method | What it does |
 |---|---|
-| `describe` | Checks that gcloud and ssh exist, a project and zone are set, an account is logged in, and `gcloud compute zones describe` works (cached for 5 minutes; failures for 30 s). Reports `available: false` with the reason otherwise. |
-| `create` | `gcloud compute instances create <prefix>-<hash of key> --async` with the machine type, image, disk, network, labels, metadata, max run duration and termination action. Returns `provisioning` within seconds. The VM name derives from the idempotency key, so a repeated key returns the same VM, even after a lost response or a reinstall ("already exists" is adopted when the VM carries the same key). |
-| `status` | `gcloud compute instances describe`. `PROVISIONING`/`STAGING` → `provisioning`; `RUNNING` → one ssh probe, `ready` once it answers and the startup script has installed `packages` (kept, so later calls are a single describe); `STOPPING`/`TERMINATED`/`SUSPENDED` → `suspended` (or `gone` at the end of the lifetime); `REPAIRING` → `failed`; missing → `gone`, or `failed` with GCP's reason when the create operation failed (`gcloud compute operations describe`). A VM started again since SSH worked is `suspended`: it may be on different hardware. Running without working SSH for `readyTimeoutMinutes` → `failed`. |
+| `describe` | Checks that gcloud and ssh exist, a project and zone are set, an account is logged in, and `gcloud compute zones describe` works (cached for 5 minutes; failures for 30 s). Reports `available: false` with the reason otherwise. Lists the machine options `create` accepts in `machineOptions`. |
+| `create` | `gcloud compute instances create <prefix>-<hash of key> --async` with the machine type, image, disk, network, labels, metadata, max run duration and termination action, and the flags of any [machine options](#production-like-nodes) (an unknown option is `[invalid] unknown machine option <key>`). Returns `provisioning` within seconds. The VM name derives from the idempotency key and the machine options, so a repeated key with the same options returns the same VM, even after a lost response or a reinstall ("already exists" is adopted when the VM carries the same key and options); the same key with other options is another VM. |
+| `status` | `gcloud compute instances describe`. `PROVISIONING`/`STAGING` → `provisioning`; `RUNNING` → one ssh probe, `ready` once it answers and the startup script has installed `packages` (kept, so later calls are a single describe); `STOPPING`/`TERMINATED`/`SUSPENDED` → `suspended` (or `gone` at the end of the lifetime); `REPAIRING` → `failed`; missing → `gone`, or `failed` with GCP's reason when the create operation failed (`gcloud compute operations describe`), as is a new VM GCP stops before it was ever ready because its create failed (a stockout shows that way). A VM started again since SSH worked is `suspended`: it may be on different hardware. Running without working SSH for `readyTimeoutMinutes` → `failed`. |
 | `list` | `gcloud compute instances list --filter="labels.<prefix>-managed=true AND labels.<prefix>_<key>=<value>…"` across all zones of the project, then an exact match on the caller's labels kept verbatim in metadata. Only VMs carrying the provider's label are ever listed. |
 | `destroy` | `gcloud compute instances delete`, started detached (a delete takes a minute or two, longer than an RPC may run); `ok: true` at once, and the VM is `gone` from then on. Idempotent. If the VM is still there 3 minutes later, `list` sends the delete again. |
-| `info` | One ssh round trip: `uname`, `/etc/os-release`, `/proc/cpuinfo`, `nproc`, `lscpu`, `/proc/meminfo`, cgroup `cpu.max`/`memory.max`, `git --version`; plus machine type and CPU platform from `describe`. With no cgroup quota the CPU quota is the VM's vCPUs. |
+| `info` | One ssh round trip: `uname`, `/etc/os-release`, `/proc/cpuinfo`, `nproc`, `lscpu`, `/proc/meminfo`, cgroup `cpu.max`/`memory.max`, `git --version`; plus, in `extra`, the machine type, CPU platform, minimum CPU platform, threads per core, vCPUs, turbo mode, performance monitoring unit and provisioning model from the VM and `describe`, the machine options it was created with, and `machineNote` when the VM has more vCPUs or less memory than asked for. With no cgroup quota the CPU quota is the VM's vCPUs. |
 | `putFile` | The file streams over ssh's stdin into a temporary file next to the target, which is renamed into place; parent directories are created as the remote user, the mode applied, and the VM's sha256 and size must match what was sent. |
 | `getFile` | One ssh round trip that sends the size and sha256, then the file; both are checked before the local file is renamed into place. |
 | `execStart` | Starts a wrapper with `setsid nohup` over ssh and returns once it runs. The wrapper puts the command (argv, or `bash -lc <script>`) in its own process group with stdout and stderr in files under `~/.bb-bench-gcp/exec/<id>/`, kills the group at `timeoutSeconds` (`signal: "TIMEOUT"`), and writes an exit record. |
@@ -130,7 +131,7 @@ are `[invalid]`.
 | `account` | gcloud's active account | `--account` for every gcloud call. |
 | `machineSeries` | `n2` | Series for `<series>-standard-<n>`. |
 | `machineTypes` | none | JSON, core count → machine type, e.g. `{"8": "c3d-standard-8"}`. Wins over the series. |
-| `threadsPerCore` | `default` | `1` turns SMT off (`--threads-per-core=1`). |
+| `threadsPerCore` | `default` | `1` turns SMT off (`--threads-per-core=1`). The `threadsPerCore` machine option sets it per VM. |
 | `imageFamily`, `imageProject` | `debian-12`, `debian-cloud` | Boot image. bb-autoresearch needs bash, tar and git 2.38 or newer; Debian 12's cloud image has no git, so `packages` installs it (2.39). |
 | `bootDiskSizeGb`, `bootDiskType` | 20, auto | `pd-balanced`, or `hyperdisk-balanced` for series that boot only from Hyperdisk (n4, c4, …). |
 | `network`, `subnet` | default | VPC placement. |
@@ -163,6 +164,73 @@ On most series a vCPU is a hardware thread, so an n2-standard-8 is 4 physical
 cores. For benchmarks, `t2d` (one vCPU per core) or `threadsPerCore = "1"`
 avoid sharing cores between threads.
 
+## Production-like nodes
+
+The settings shape every VM the same. To measure on a machine like the one
+your code runs on in production, a study can give each
+`[[oracle.remote_bench]]` entry its own `machine` options (bench provider
+contract v1's `machine` field, bb-autoresearch 1.0 or newer). Each option
+overrides the matching setting for that VM only; without `machine`, the
+settings decide as before. `describe` lists the options, and `create` refuses
+any other key with `[invalid] unknown machine option <key>`.
+
+```toml
+# A C4D (AMD Turin) node with SMT off: 16 vCPUs of hardware threads become
+# 8 whole cores, all at their all-core turbo, with perf counters.
+[[oracle.remote_bench]]
+provider = "bench-provider-gcp"
+cores = 8
+lifetime_minutes = 120
+machine = { type = "c4d-standard-16", threadsPerCore = 1, turboMode = "ALL_CORE_MAX", performanceMonitoringUnit = "standard" }
+
+# An Intel Sapphire Rapids node on Ubuntu, in the zone that has the type.
+[[oracle.remote_bench]]
+provider = "bench-provider-gcp"
+cores = 8
+lifetime_minutes = 120
+machine = { type = "c3-standard-8", zone = "us-central1-b", imageFamily = "ubuntu-2404-lts-amd64", imageProject = "ubuntu-os-cloud", bootDiskGb = 50 }
+```
+
+| Option | gcloud flag | Meaning |
+|---|---|---|
+| `type` | `--machine-type` | Machine type, such as `c4d-standard-16` or `n2-custom-8-16384`. Wins over `machineSeries` and `machineTypes`. |
+| `series` | `--machine-type` | A series for this VM: the smallest `<series>-standard-<n>` with at least `cores` vCPUs after `threadsPerCore`. Not with `type`. |
+| `threadsPerCore` | `--threads-per-core` | `1` (SMT off: a vCPU is a whole core, and the type has half its usual vCPUs) or `2`. |
+| `visibleCoreCount` | `--visible-core-count` | Physical cores the guest sees; its vCPUs are this times the threads per core. |
+| `minCpuPlatform` | `--min-cpu-platform` | Oldest CPU platform allowed, such as `"Intel Sapphire Rapids"` or `"AMD Genoa"`; `gcloud compute zones describe <zone> --format="value(availableCpuPlatforms)"` lists a zone's. |
+| `turboMode` | `--turbo-mode` | `ALL_CORE_MAX`: every core at its all-core turbo frequency, for steadier timings (c4, c4d and other series that support it). |
+| `performanceMonitoringUnit` | `--performance-monitoring-unit` | Hardware performance counters in the guest (for `perf`): `architectural`, `standard` or `enhanced` (c4, c4d, c3, c3d, …). |
+| `image` | `--image` | A specific boot image in `imageProject`. Not with `imageFamily`. |
+| `imageFamily`, `imageProject` | `--image-family`, `--image-project` | Boot image family and the project that holds it. |
+| `bootDiskGb` | `--boot-disk-size` | Boot disk size in GB. |
+| `bootDiskType` | `--boot-disk-type` | Such as `pd-ssd` or `hyperdisk-balanced`. Default: `pd-balanced`, or `hyperdisk-balanced` for series that need it. |
+| `bootDiskIops`, `bootDiskThroughput` | `--boot-disk-provisioned-iops`, `--boot-disk-provisioned-throughput` | Provisioned IOPS and MB/s of a Hyperdisk (or pd-extreme) boot disk. |
+| `spot` | `--provisioning-model` | `true`: a Spot VM; `false`: standard, whatever `provisioningModel` says. |
+| `zone` | `--zone` | Zone for this VM, in the provider's project. The host id carries it. |
+| `networkTier` | `--network-tier` | `PREMIUM` or `STANDARD`, for the external IP. |
+
+Values may be TOML numbers, booleans or strings (`threadsPerCore = 1` and
+`threadsPerCore = "1"` are the same option).
+
+**The vCPU check.** With `type`, `series`, `threadsPerCore` or
+`visibleCoreCount`, `create` works out the vCPUs the guest will see (from
+`gcloud compute machine-types describe`, cached; a custom type's are in its
+name): fewer than `cores` is `[invalid]`, before any VM exists (for example
+`c4d-standard-8 with threadsPerCore 1 has 4 vCPUs, fewer than the 8 cores
+asked for`); more is allowed and noted in `info`'s `machineNote`, as is less
+memory than `memoryGb`. A type the zone doesn't have is `[invalid]` too.
+
+**Idempotency.** The machine options are part of the VM's identity: the name
+hashes the idempotency key with the options in canonical form (sorted, typed),
+and the VM's metadata keeps them. The same key with the same options returns
+the same VM; the same key with other options makes another VM and never
+adopts the old one. Without options, names are what they were before.
+
+**What you get.** `info` reports what GCP gave: `extra.machineType`,
+`cpuPlatform` (for example `AMD Turin`), `threadsPerCore` (the guest's
+`lscpu`), `vcpus`, and the options. bb-autoresearch records it with each
+measurement.
+
 ### Labels
 
 Caller labels are freer than GCP's (up to 200 characters, any case), so each
@@ -184,6 +252,15 @@ reboot (`LOST`), a git bundle fetched and a benchmark run in a worktree, then
 `destroy`; polls took about 200 ms, and every VM was gone a minute after its
 destroy.
 
+Per-node machine options were checked live the same way: `describe` listed
+them, `machine = { type = "c4d-standard-8", threadsPerCore = 1 }` with 8
+cores was refused before any VM existed (4 vCPUs), an unknown option was
+refused, and with 4 cores (and a `zone` option, after the first zones were
+out of C4D capacity, which `status` reported as `failed` with GCP's
+`ZONE_RESOURCE_POOL_EXHAUSTED` reason) the VM was `ready` 40 s after its
+create; `info` reported `c4d-standard-8`, CPU platform `AMD Turin`
+(`AMD EPYC 9B45`), 1 thread per core and 4 vCPUs. Every VM was deleted.
+
 ## Development
 
 ```sh
@@ -194,7 +271,7 @@ bb plugin build
 ```
 
 The tests drive the plugin through BB's fake plugin host. `test/fake/` holds a
-fake `gcloud` (instances, operations, `compute ssh --dry-run`) and a fake
+fake `gcloud` (instances, operations, machine types, `compute ssh --dry-run`) and a fake
 `ssh` that runs remote commands with bash in a per-VM directory, so every
 remote script runs for real. `src/contract.ts` is a copy of bb-autoresearch's
 `src/bench-provider/contract.ts`; a test checks its fingerprint.

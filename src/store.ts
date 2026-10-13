@@ -5,17 +5,23 @@
 
 import { createHash } from "node:crypto";
 import type { HostState } from "./contract.ts";
+import type { GcpMachine } from "./machine-options.ts";
 
 export interface HostRecord {
   hostId: string;
   project: string;
   zone: string;
   name: string;
+  /** The idempotency identity: the create's key, plus its machine options when it had any. */
   key: string;
   labels: Record<string, string>;
   cores: number;
   memoryGb: number | null;
   machineType: string;
+  /** The create's machine options, when it had any. */
+  machine?: GcpMachine;
+  /** What the VM has beyond what was asked for (more vCPUs, less memory). */
+  machineNote?: string;
   /** Packages the VM's startup script installs; `ready` waits for them. */
   packages?: string[];
   /** ms */

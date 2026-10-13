@@ -18,7 +18,8 @@ import { BENCH_PROVIDER_CONTRACT_VERSION, EXEC_POLL_MAX_BYTES, type HostState, t
 import { ProviderError, asProviderError, clip, mapGcloudError } from "./errors.ts";
 import { Budget, Gcloud, Tools } from "./gcloud.ts";
 import { MAX_GCP_LABELS, labelFilter, labelsFlag, labelsMatch, parseExtraLabels, toGcpLabels } from "./labels.ts";
-import { bootDiskType, chooseMachineType, parseOverrides } from "./machine-types.ts";
+import { canonicalMachine, machineOptionList, parseMachine, type GcpMachine } from "./machine-options.ts";
+import { bootDiskType, chooseMachineType, customShape, defaultThreadsPerCore, effectiveVcpus, parseOverrides } from "./machine-types.ts";
 import { CANCEL, EXEC_ID_PATTERN, GET, INFO, LAUNCH, POLL, PROBE, PUT, parsePackages, startupScript, cpuQuotaCores, memoryLimitBytes, parseKv, utf8SafeLength } from "./remote.ts";
 import { Ssh, type SshTarget } from "./ssh.ts";
 import { HostStore, type HostRecord } from "./store.ts";
@@ -77,6 +78,8 @@ interface Instance {
   lastStartTimestamp?: string;
   machineType?: string;
   cpuPlatform?: string;
+  minCpuPlatform?: string;
+  advancedMachineFeatures?: { threadsPerCore?: number; visibleCoreCount?: number; turboMode?: string; performanceMonitoringUnit?: string };
   labels?: Record<string, string>;
   metadata?: { items?: { key: string; value?: string }[] };
   scheduling?: { terminationTime?: string; maxRunDuration?: { seconds?: string | number }; provisioningModel?: string };
@@ -97,6 +100,20 @@ interface VmInfo {
   memoryGb: number | null;
   /** Packages the startup script installs ([] or missing: none). */
   packages?: string[];
+  /** The create's machine options (missing: none); with the key, the VM's identity. */
+  machine?: GcpMachine;
+}
+
+/** A machine type's shape as `gcloud compute machine-types describe` reports it. */
+interface MachineShape {
+  guestCpus: number;
+  memoryMb: number;
+}
+
+/** The idempotency identity: the key, plus the machine options when there are any. */
+export function identityOf(key: string, machine: GcpMachine): string {
+  const canonical = canonicalMachine(machine);
+  return canonical === "" ? key : `${key}\n${canonical}`;
 }
 
 export const INFO_METADATA_KEY = "bb-bench-gcp";
@@ -180,6 +197,8 @@ export class GcpBenchProvider {
   private readonly budgetMs: number | undefined;
   private configCache: { at: number; project: string; zone: string } | null = null;
   private describeCache: { at: number; ok: boolean; reason?: string; key: string } | null = null;
+  /** Machine type shapes by project/zone/type; they don't change. */
+  private readonly shapes = new Map<string, MachineShape>();
 
   constructor(opts: ProviderOptions) {
     this.settings = opts.settings;
@@ -249,6 +268,7 @@ export class GcpBenchProvider {
       maxHosts: s.maxHosts,
       maxLifetimeSeconds: s.maxLifetimeMinutes * 60,
       cores: { min: 1, max: s.maxCores },
+      machineOptions: machineOptionList(),
     };
     const cacheKey = JSON.stringify([s.project, s.zone, s.account, s.gcloudPath]);
     const c = this.describeCache;
@@ -274,8 +294,10 @@ export class GcpBenchProvider {
   async create(input: MethodInput<"benchProvider.create">): Promise<MethodOutput<"benchProvider.create">> {
     const s = await this.settings();
     const budget = this.budget();
+    const machine = parseMachine(input.machine);
+    const identity = identityOf(input.key, machine);
     if (input.cores > s.maxCores) throw new ProviderError("invalid", `cores must be at most ${s.maxCores} (the maxCores setting), got ${input.cores}`);
-    const known = await this.store.byKey(input.key);
+    const known = await this.store.byKey(identity);
     if (known) {
       try {
         const st = await this.status({ hostId: known.hostId });
@@ -289,11 +311,15 @@ export class GcpBenchProvider {
     if (live.length >= s.maxHosts) throw new ProviderError("capacity", `${live.length} VMs are already running (the maxHosts setting is ${s.maxHosts})`);
     if (Object.keys(input.labels).length + 2 > MAX_GCP_LABELS) throw new ProviderError("invalid", `at most ${MAX_GCP_LABELS - 2} labels`);
 
-    const { project, zone } = await this.where(budget);
+    const where = await this.where(budget);
+    const project = where.project;
+    const zone = machine.zone ?? where.zone;
     const prefix = s.labelPrefix;
-    const target: SshTarget = { project, zone, name: vmName(s.namePrefix, input.key) };
+    const target: SshTarget = { project, zone, name: vmName(s.namePrefix, identity) };
     const hostId = hostIdOf(target);
-    const machineType = chooseMachineType(s.machineSeries, input.cores, input.memoryGb, parseOverrides(s.machineTypes));
+    const threadsPerCore = machine.threadsPerCore ?? (s.threadsPerCore === "1" ? 1 : s.threadsPerCore === "2" ? 2 : undefined);
+    const machineType = this.machineTypeFor(s, machine, input.cores, input.memoryGb);
+    const fit = await this.checkFit(project, zone, machineType, machine, threadsPerCore, input, budget);
     const lifetime = Math.max(MIN_LIFETIME_SECONDS, Math.min(input.lifetimeSeconds, s.maxLifetimeMinutes * 60));
     const publicKey = await this.ensureSshKey(this.keyFile(s), s.sshUser, budget);
     let packages: string[];
@@ -302,7 +328,7 @@ export class GcpBenchProvider {
     } catch (error) {
       throw new ProviderError("invalid", (error as Error).message);
     }
-    const info: VmInfo = { key: input.key, labels: input.labels, cores: input.cores, memoryGb: input.memoryGb ?? null, packages };
+    const info: VmInfo = { key: input.key, labels: input.labels, cores: input.cores, memoryGb: input.memoryGb ?? null, packages, ...(canonicalMachine(machine) ? { machine } : {}) };
     let extra: Record<string, string>;
     try {
       extra = parseExtraLabels(s.extraLabels, prefix);
@@ -312,6 +338,7 @@ export class GcpBenchProvider {
     if (Object.keys(input.labels).length + Object.keys(extra).length + 2 > MAX_GCP_LABELS) throw new ProviderError("invalid", `at most ${MAX_GCP_LABELS} labels per VM, counting the extraLabels setting`);
     const gcpLabels = { ...extra, [`${prefix}-managed`]: "true", [`${prefix}-key`]: target.name.slice(s.namePrefix.length + 1), ...toGcpLabels(prefix, input.labels) };
 
+    const spot = machine.spot ?? s.provisioningModel === "spot";
     const dir = mkdtempSync(join(tmpdir(), "bb-bench-gcp-"));
     try {
       writeFileSync(join(dir, "info.json"), JSON.stringify(info));
@@ -326,15 +353,15 @@ export class GcpBenchProvider {
         `--project=${project}`,
         `--zone=${zone}`,
         `--machine-type=${machineType}`,
-        `--image-family=${s.imageFamily}`,
-        `--image-project=${s.imageProject}`,
-        `--boot-disk-size=${s.bootDiskSizeGb}GB`,
-        `--boot-disk-type=${bootDiskType(s.bootDiskType, machineType)}`,
+        machine.image ? `--image=${machine.image}` : `--image-family=${machine.imageFamily ?? s.imageFamily}`,
+        `--image-project=${machine.imageProject ?? s.imageProject}`,
+        `--boot-disk-size=${machine.bootDiskGb ?? s.bootDiskSizeGb}GB`,
+        `--boot-disk-type=${bootDiskType(machine.bootDiskType ?? s.bootDiskType, machineType)}`,
         `--labels=${labelsFlag(gcpLabels)}`,
         `--metadata-from-file=${metadataFiles.join(",")}`,
         `--max-run-duration=${lifetime}s`,
         "--instance-termination-action=DELETE",
-        `--provisioning-model=${s.provisioningModel === "spot" ? "SPOT" : "STANDARD"}`,
+        `--provisioning-model=${spot ? "SPOT" : "STANDARD"}`,
         "--no-service-account",
         "--no-scopes",
         "--async",
@@ -343,14 +370,21 @@ export class GcpBenchProvider {
       if (s.network.trim()) args.push(`--network=${s.network.trim()}`);
       if (s.subnet.trim()) args.push(`--subnet=${s.subnet.trim()}`);
       if (!s.externalIp) args.push("--no-address");
-      if (s.threadsPerCore === "1" || s.threadsPerCore === "2") args.push(`--threads-per-core=${s.threadsPerCore}`);
+      if (threadsPerCore !== undefined) args.push(`--threads-per-core=${threadsPerCore}`);
+      if (machine.visibleCoreCount !== undefined) args.push(`--visible-core-count=${machine.visibleCoreCount}`);
+      if (machine.minCpuPlatform !== undefined) args.push(`--min-cpu-platform=${machine.minCpuPlatform}`);
+      if (machine.turboMode !== undefined) args.push(`--turbo-mode=${machine.turboMode}`);
+      if (machine.performanceMonitoringUnit !== undefined) args.push(`--performance-monitoring-unit=${machine.performanceMonitoringUnit}`);
+      if (machine.bootDiskIops !== undefined) args.push(`--boot-disk-provisioned-iops=${machine.bootDiskIops}`);
+      if (machine.bootDiskThroughput !== undefined) args.push(`--boot-disk-provisioned-throughput=${machine.bootDiskThroughput}`);
+      if (machine.networkTier !== undefined) args.push(`--network-tier=${machine.networkTier}`);
 
       const createdAt = this.now();
       const result = await this.gcloud.raw(args, budget.take(45_000, "gcloud compute instances create"));
       if (result.timedOut) throw new ProviderError("transient", `creating ${target.name}: gcloud did not finish in time; retry with the same key`);
       let operation: string | null = null;
       if (result.code !== 0) {
-        if (/already exists/iu.test(result.stderr)) return await this.adopt(target, input, machineType, lifetime, budget);
+        if (/already exists/iu.test(result.stderr)) return await this.adopt(target, input, machine, machineType, lifetime, budget);
         const mapped = mapGcloudError(`creating ${target.name} (${machineType} in ${zone})`, result.stderr);
         // A missing image, network or machine type is a bad setting, not a missing VM.
         throw mapped.code === "not_found" ? new ProviderError("invalid", mapped.message.replace(/^\[not_found\] /u, "")) : mapped;
@@ -359,11 +393,13 @@ export class GcpBenchProvider {
       const record: HostRecord = {
         hostId,
         ...target,
-        key: input.key,
+        key: identity,
         labels: input.labels,
         cores: input.cores,
         memoryGb: input.memoryGb ?? null,
         machineType,
+        ...(canonicalMachine(machine) ? { machine } : {}),
+        ...(fit?.note ? { machineNote: fit.note } : {}),
         packages,
         createdAt,
         expiresAt: createdAt + lifetime * 1000,
@@ -371,7 +407,7 @@ export class GcpBenchProvider {
         lastState: "provisioning",
       };
       await this.store.put(record);
-      this.log(`create ${hostId}: ${machineType}, lifetime ${lifetime}s, ${s.provisioningModel}`);
+      this.log(`create ${hostId}: ${machineType}${canonicalMachine(machine) ? ` ${canonicalMachine(machine)}` : ""}, lifetime ${lifetime}s, ${spot ? "spot" : "standard"}${fit?.note ? ` (${fit.note})` : ""}`);
       return { hostId, state: "provisioning", expiresAt: iso(record.expiresAt) };
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -379,10 +415,10 @@ export class GcpBenchProvider {
   }
 
   /** A create that found its VM already there (a retry after a lost response): take it if it carries this key. */
-  private async adopt(target: SshTarget, input: MethodInput<"benchProvider.create">, machineType: string, lifetime: number, budget: Budget): Promise<MethodOutput<"benchProvider.create">> {
+  private async adopt(target: SshTarget, input: MethodInput<"benchProvider.create">, machine: GcpMachine, machineType: string, lifetime: number, budget: Budget): Promise<MethodOutput<"benchProvider.create">> {
     const inst = await this.describeInstance(target, budget);
     const info = inst ? vmInfo(inst) : null;
-    if (!inst || !info || info.key !== input.key) {
+    if (!inst || !info || info.key !== input.key || canonicalMachine(info.machine ?? {}) !== canonicalMachine(machine)) {
       throw new ProviderError(inst ? "invalid" : "transient", `a VM named ${target.name} already exists${inst ? " and was not created for this key" : " (being deleted?)"}`);
     }
     const hostId = hostIdOf(target);
@@ -390,11 +426,12 @@ export class GcpBenchProvider {
     const record: HostRecord = {
       hostId,
       ...target,
-      key: input.key,
+      key: identityOf(input.key, machine),
       labels: input.labels,
       cores: input.cores,
       memoryGb: input.memoryGb ?? null,
       machineType: lastSegment(inst.machineType) || machineType,
+      ...(canonicalMachine(machine) ? { machine } : {}),
       packages: info.packages ?? [],
       createdAt,
       expiresAt: terminationMs(inst) ?? createdAt + lifetime * 1000,
@@ -433,6 +470,17 @@ export class GcpBenchProvider {
 
     const expiresAt = terminationMs(inst) ?? record?.expiresAt ?? null;
     let state = this.stateOf(inst, record);
+
+    // A VM that stops before it was ever ready may be a create GCP gave up on (a
+    // stockout shows as STOPPING, then the VM vanishes): that is `failed`, with GCP's reason.
+    if (record && !record.readyAt && record.operation && state === "suspended" && this.now() - record.createdAt < 15 * 60_000) {
+      const op = await this.describeOperation(target, record.operation, budget).catch(() => null);
+      if (op?.error?.errors?.length) {
+        const why = op.error.errors.map((e) => `${e.code ?? "ERROR"}: ${e.message ?? ""}`).join("; ");
+        await this.store.update(hostId, { lastState: "failed", detail: clip(why, 1900) });
+        return { state: "failed", expiresAt: iso(expiresAt), detail: clip(`create failed: ${why}`, 2000) };
+      }
+    }
     let detail: string | undefined = state !== "ready" && inst.status ? `GCE ${inst.status}${inst.statusMessage ? `: ${inst.statusMessage}` : ""}` : undefined;
 
     if (record && inst.status === "RUNNING" && state === "provisioning") {
@@ -591,8 +639,18 @@ export class GcpBenchProvider {
     const machineType = lastSegment(inst?.machineType) || record?.machineType;
     if (machineType) extra.machineType = machineType;
     if (inst?.cpuPlatform) extra.cpuPlatform = inst.cpuPlatform;
+    if (inst?.minCpuPlatform) extra.minCpuPlatform = inst.minCpuPlatform;
     if (inst?.scheduling?.provisioningModel) extra.provisioningModel = inst.scheduling.provisioningModel;
+    const features = inst?.advancedMachineFeatures ?? {};
+    // The guest's own lscpu wins for threadsPerCore; GCP's setting fills in when lscpu says nothing.
+    if (!extra.threadsPerCore && features.threadsPerCore) extra.threadsPerCore = String(features.threadsPerCore);
+    if (features.visibleCoreCount) extra.visibleCoreCount = String(features.visibleCoreCount);
+    if (features.turboMode) extra.turboMode = features.turboMode;
+    if (features.performanceMonitoringUnit) extra.performanceMonitoringUnit = features.performanceMonitoringUnit;
+    if (nproc !== null) extra.vcpus = String(nproc);
     if (record) extra.requestedCores = String(record.cores);
+    if (record?.machine && canonicalMachine(record.machine)) extra.machineOptions = canonicalMachine(record.machine);
+    if (record?.machineNote) extra.machineNote = record.machineNote;
     const quota = cpuQuotaCores(all.get("cgCpuMax") ?? []);
     const memLimit = memoryLimitBytes(all.get("cgMemoryMax") ?? []);
     const memBytes = memTotalKb !== null ? memTotalKb * 1024 : num(one.get("memBytes"));
@@ -823,6 +881,71 @@ export class GcpBenchProvider {
       if (inst && inst.status !== "RUNNING") throw new ProviderError("not_found", `${target.name} is ${inst.status}`);
       throw e;
     }
+  }
+
+  /**
+   * The machine type for a create: the `type` option, else the series (the
+   * option's, or the settings') sized for `cores`. With threadsPerCore 1 on a
+   * two-thread series the size doubles, so the VM still has `cores` vCPUs;
+   * the machineTypes table is then skipped (its sizes assume SMT).
+   */
+  private machineTypeFor(s: Settings, machine: GcpMachine, cores: number, memoryGb: number | undefined): string {
+    if (machine.type) return machine.type;
+    const series = machine.series ?? s.machineSeries;
+    const halved = machine.threadsPerCore === 1 && defaultThreadsPerCore(`${series}-standard-2`) === 2;
+    const overrides = machine.series || halved ? {} : parseOverrides(s.machineTypes);
+    return chooseMachineType(series, halved ? cores * 2 : cores, memoryGb, overrides);
+  }
+
+  /**
+   * With machine options that shape the CPUs (type, series, threadsPerCore,
+   * visibleCoreCount): the vCPUs the guest will see must cover `cores`
+   * (`[invalid]` if not); more is noted. null when no option shapes the CPUs.
+   */
+  private async checkFit(
+    project: string,
+    zone: string,
+    machineType: string,
+    machine: GcpMachine,
+    threadsPerCore: 1 | 2 | undefined,
+    input: MethodInput<"benchProvider.create">,
+    budget: Budget,
+  ): Promise<{ vcpus: number; note?: string } | null> {
+    if (machine.type === undefined && machine.series === undefined && machine.threadsPerCore === undefined && machine.visibleCoreCount === undefined) return null;
+    const shape = customShape(machineType) ?? (await this.machineShape(project, zone, machineType, budget));
+    const vcpus = effectiveVcpus(machineType, shape.guestCpus, threadsPerCore, machine.visibleCoreCount);
+    const how = [threadsPerCore !== undefined ? `threadsPerCore ${threadsPerCore}` : "", machine.visibleCoreCount !== undefined ? `visibleCoreCount ${machine.visibleCoreCount}` : ""].filter(Boolean).join(", ");
+    const shown = `${machineType}${how ? ` with ${how}` : ""}`;
+    if (vcpus < input.cores) throw new ProviderError("invalid", `${shown} has ${vcpus} vCPUs, fewer than the ${input.cores} cores asked for`);
+    const notes: string[] = [];
+    if (vcpus > input.cores) notes.push(`${shown} has ${vcpus} vCPUs, more than the ${input.cores} cores asked for`);
+    if (input.memoryGb !== undefined && shape.memoryMb < input.memoryGb * 1024) notes.push(`${machineType} has ${Math.round(shape.memoryMb / 102.4) / 10} GB of memory, less than the ${input.memoryGb} GB asked for`);
+    return notes.length > 0 ? { vcpus, note: notes.join("; ") } : { vcpus };
+  }
+
+  /** `gcloud compute machine-types describe`, cached: a missing type is a bad option, `[invalid]`. */
+  private async machineShape(project: string, zone: string, machineType: string, budget: Budget): Promise<MachineShape> {
+    const cacheKey = `${project}/${zone}/${machineType}`;
+    const hit = this.shapes.get(cacheKey);
+    if (hit) return hit;
+    let found: { guestCpus?: number; memoryMb?: number } | null;
+    try {
+      found = await this.gcloud.json<{ guestCpus?: number; memoryMb?: number }>(
+        ["compute", "machine-types", "describe", machineType, `--zone=${zone}`, `--project=${project}`],
+        `describing machine type ${machineType}`,
+        budget.take(20_000, "gcloud compute machine-types describe"),
+      );
+    } catch (error) {
+      if (error instanceof ProviderError && error.code === "not_found") {
+        throw new ProviderError("invalid", `machine type ${machineType} does not exist in ${zone} (gcloud compute machine-types list --zones=${zone})`);
+      }
+      throw error;
+    }
+    const guestCpus = Number(found?.guestCpus);
+    if (!Number.isFinite(guestCpus) || guestCpus < 1) throw new ProviderError("internal", `gcloud reported no vCPU count for ${machineType}`);
+    const shape = { guestCpus, memoryMb: Number(found?.memoryMb) || 0 };
+    this.shapes.set(cacheKey, shape);
+    return shape;
   }
 
   private async describeInstance(t: SshTarget, budget: Budget): Promise<Instance | null> {

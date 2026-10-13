@@ -112,6 +112,16 @@ function removeVm(name) {
   rmSync(join(vmsDir, name), { recursive: true, force: true });
 }
 
+/** --threads-per-core and friends as the instance's advancedMachineFeatures (null: none). */
+function advanced(f) {
+  const out = {};
+  if (f["threads-per-core"]) out.threadsPerCore = Number(f["threads-per-core"]);
+  if (f["visible-core-count"]) out.visibleCoreCount = Number(f["visible-core-count"]);
+  if (f["turbo-mode"]) out.turboMode = f["turbo-mode"];
+  if (f["performance-monitoring-unit"]) out.performanceMonitoringUnit = f["performance-monitoring-unit"].toUpperCase();
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 function print(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
@@ -161,7 +171,9 @@ switch (command) {
         machineType: `https://www.googleapis.com/compute/v1/projects/${flags.project}/zones/${flags.zone}/machineTypes/${flags["machine-type"]}`,
         status: "PROVISIONING",
         creationTimestamp: new Date(now).toISOString(),
-        cpuPlatform: "Fake CPU Platform",
+        cpuPlatform: flags["min-cpu-platform"] ?? "Fake CPU Platform",
+        ...(flags["min-cpu-platform"] ? { minCpuPlatform: flags["min-cpu-platform"] } : {}),
+        ...(advanced(flags) ? { advancedMachineFeatures: advanced(flags) } : {}),
         labels,
         metadata: { items },
         scheduling: {
@@ -190,6 +202,11 @@ switch (command) {
         child.unref();
       }
       writeFileSync(join(STATE, `${opName}.op.json`), JSON.stringify({ name: opName, status: "DONE" }));
+      // A stockout after the instance exists: GCP shows it STOPPING, and the insert operation carries the error.
+      if (config.createStopsWith) {
+        writeFileSync(vmPath(name), JSON.stringify({ ...vm, status: "STOPPING" }, null, 2));
+        writeFileSync(join(STATE, `${opName}.op.json`), JSON.stringify({ name: opName, status: "DONE", error: { errors: [config.createStopsWith] } }));
+      }
     }
     print([{ name: opName, operationType: "insert", status: "PENDING", targetLink: `https://www.googleapis.com/compute/v1/projects/${flags.project}/zones/${flags.zone}/instances/${name}` }]);
     process.stderr.write(`NOTE: The users will be charged for public IPs when VMs are created.\nCreate in progress for [https://www.googleapis.com/compute/v1/projects/${flags.project}/zones/${flags.zone}/instances/${name}].\n`);
@@ -219,6 +236,15 @@ switch (command) {
     if (config.deleteSleepMs) sleepSync(config.deleteSleepMs);
     removeVm(name);
     process.stderr.write(`Deleted [https://www.googleapis.com/compute/v1/projects/${flags.project}/zones/${flags.zone}/instances/${name}].\n`);
+    break;
+  }
+  case "compute machine-types describe": {
+    // <series>-<standard|highcpu|highmem>-<n> exist (n vCPUs, 4 GB each), unless config.missingMachineTypes lists them.
+    const name = positional[3];
+    const m = /^[a-z][a-z0-9]*-(standard|highcpu|highmem)-(\d+)$/u.exec(name ?? "");
+    if (!m || (config.missingMachineTypes ?? []).includes(name)) notFound("machineTypes", name);
+    const cpus = Number(m[2]);
+    print({ name, zone: flags.zone, guestCpus: cpus, memoryMb: cpus * (m[1] === "highcpu" ? 1024 : m[1] === "highmem" ? 8192 : 4096) });
     break;
   }
   case "compute operations describe": {

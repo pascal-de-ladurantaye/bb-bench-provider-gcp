@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-bench-provider-gcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "A BB plugin that lends Google Compute Engine VMs to bb-autoresearch as remote bench hosts, over your own gcloud CLI.",
   "license": "MIT",

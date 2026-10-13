@@ -21,10 +21,12 @@ export interface FakeConfig {
   sshDenied?: boolean;
   createError?: string;
   createOpError?: { code: string; message: string };
+  createStopsWith?: { code: string; message: string };
   deleteSleepMs?: number;
   denyProject?: string;
   osLoginUser?: string;
   reportTerminationTime?: boolean;
+  missingMachineTypes?: string[];
   inject?: Record<string, { stderr?: string; code?: number; times?: number; sleepMs?: number }>;
 }
 

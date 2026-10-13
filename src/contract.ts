@@ -30,6 +30,21 @@ const hostId = z.string().min(1).max(200);
 const labels = z.record(z.string().min(1).max(63), z.string().max(200));
 const isoOrNull = z.string().min(1).max(64).nullable();
 
+/** A machine option key: what a study may set per node (`machine = { ... }`). */
+export const MACHINE_OPTION_KEY = /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/u;
+/** At most this many machine options per create. */
+export const MAX_MACHINE_OPTIONS = 32;
+/**
+ * Provider-specific machine options for one machine (machine type, image,
+ * placement, ...). Absent or empty: the provider's defaults. A provider
+ * rejects keys it doesn't know with `[invalid] unknown machine option <key>`
+ * and lists the keys it accepts in `describe`'s `machineOptions`.
+ */
+export const machineOptionsSchema = z
+  .record(z.string().regex(MACHINE_OPTION_KEY), z.union([z.string().max(256), z.number(), z.boolean()]))
+  .refine((m) => Object.keys(m).length <= MAX_MACHINE_OPTIONS, `at most ${MAX_MACHINE_OPTIONS} machine options`);
+export type MachineOptions = z.infer<typeof machineOptionsSchema>;
+
 export const describeInput = z.object({}).strict();
 export const describeOutput = z
   .object({
@@ -40,6 +55,11 @@ export const describeOutput = z
     maxHosts: z.number().int().min(0).nullable(),
     maxLifetimeSeconds: z.number().int().min(1).nullable(),
     cores: z.object({ min: z.number().int().min(1), max: z.number().int().min(1) }).strict().nullable(),
+    /** The machine option keys `create` accepts (absent: none). */
+    machineOptions: z
+      .array(z.object({ name: z.string().regex(MACHINE_OPTION_KEY), description: z.string().max(2000) }).strict())
+      .max(MAX_MACHINE_OPTIONS)
+      .optional(),
   })
   .strict();
 
@@ -51,6 +71,8 @@ export const createInput = z
     memoryGb: z.number().positive().max(16_384).optional(),
     lifetimeSeconds: z.number().int().min(1),
     labels,
+    /** Per-machine options from the provider's `machineOptions` (absent or empty: its defaults). */
+    machine: machineOptionsSchema.optional(),
   })
   .strict();
 export const createOutput = z.object({ hostId, state: hostStateSchema, expiresAt: isoOrNull }).strict();
